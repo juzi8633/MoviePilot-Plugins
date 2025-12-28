@@ -386,7 +386,6 @@ class P123Api:
         """
         发送上传完成 Webhook
         """
-        # [优化] 日志格式更清晰，不堆积在一行
         logger.info(f"【123】触发Webhook | 文件: {file_name} | 状态: {status} | 速度: {speed or 'N/A'}")
         
         if not self.webhook_url:
@@ -403,8 +402,16 @@ class P123Api:
                 "speed": speed,
                 "timestamp": int(time.time())
             }
-            requests.post(self.webhook_url, json=payload, timeout=5)
-            logger.debug(f"【123】Webhook请求已发送")
+            # [修改点] 捕获返回值并打印详细日志
+            resp = requests.post(self.webhook_url, json=payload, timeout=5)
+            
+            # 打印响应状态码和内容
+            logger.info(f"【123】Webhook响应: Code={resp.status_code}, Body={resp.text}")
+            
+            # 如果不是200，打印警告
+            if resp.status_code != 200:
+                logger.warning(f"【123】Webhook接口返回了错误的状态码: {resp.status_code}")
+                
         except Exception as e:
             logger.warning(f"【123】Webhook发送异常: {e}")
 
@@ -476,7 +483,6 @@ class P123Api:
         logger.info(f"【123】开始处理文件: {target_name} ({StringUtils.str_filesize(file_size)})")
 
         # 1. 计算MD5
-        # [优化] 移除计算过程中的 debug 日志，只保留开始和结束
         file_md5 = ""
         with open(local_path, "rb") as f:
             hash_md5 = md5()
@@ -495,7 +501,6 @@ class P123Api:
                 "duplicate": 2,
             }
             
-            # [关键修改] 尝试申请分片大小，并记录日志
             if self.target_slice_size:
                 upload_req_payload["sliceSize"] = self.target_slice_size
                 logger.debug(f"【123】尝试申请分片大小: {StringUtils.str_filesize(self.target_slice_size)}")
@@ -528,7 +533,6 @@ class P123Api:
             upload_data = resp["data"]
             slice_size = int(upload_data["SliceSize"])
             
-            # [关键日志] 检查服务器是否接受了我们的分片设置
             if self.target_slice_size and slice_size != self.target_slice_size:
                 logger.warning(
                     f"【123】分片设置未生效！申请: {StringUtils.str_filesize(self.target_slice_size)}, "
@@ -561,7 +565,7 @@ class P123Api:
                     slice_no += 1
 
                 downloaded_size = 0
-                last_log_time = 0 # [优化] 用于控制进度日志频率
+                last_log_time = 0 
                 
                 with open(local_path, "rb") as f:
                     with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mmapped_file:
@@ -583,7 +587,7 @@ class P123Api:
                                     bytes_uploaded = future.result()
                                     downloaded_size += bytes_uploaded
                                     
-                                    # [优化] 控制台/日志心跳：每15秒打印一次进度，防止看起来像卡死
+                                    # 控制台/日志心跳：每15秒打印一次进度
                                     current_time = time.time()
                                     if current_time - last_log_time > 15:
                                         percent = int((downloaded_size / file_size) * 100)
@@ -669,11 +673,16 @@ class P123Api:
             modify_time=int(datetime.fromisoformat(data["UpdateAt"]).timestamp()),
         )
 
-    # 以下为原有的 detail, copy, move 等方法，保持不变，这里省略以节省篇幅，请保留原有的实现
     def detail(self, fileitem: schemas.FileItem) -> Optional[schemas.FileItem]:
+        """
+        获取文件详情
+        """
         return self.get_item(Path(fileitem.path))
 
     def copy(self, fileitem: schemas.FileItem, path: Path, new_name: str) -> bool:
+        """
+        复制文件
+        """
         try:
             resp = self.client.fs_copy(
                 fileitem.fileid, parent_id=self._path_to_id(str(path))
@@ -683,6 +692,7 @@ class P123Api:
             new_path = Path(path) / fileitem.name
             new_item = self.get_item(new_path)
             self.rename(new_item, new_name)
+            # 更新缓存
             del self._id_cache[fileitem.path]
             rename_new_path = Path(path) / new_name
             self._id_cache[str(rename_new_path)] = new_item.fileid
@@ -691,6 +701,9 @@ class P123Api:
             return False
 
     def move(self, fileitem: schemas.FileItem, path: Path, new_name: str) -> bool:
+        """
+        移动文件
+        """
         try:
             resp = self.client.fs_move(
                 fileitem.fileid, parent_id=self._path_to_id(str(path))
@@ -700,6 +713,7 @@ class P123Api:
             new_path = Path(path) / fileitem.name
             new_item = self.get_item(new_path)
             self.rename(new_item, new_name)
+            # 更新缓存
             del self._id_cache[fileitem.path]
             rename_new_path = Path(path) / new_name
             self._id_cache[str(rename_new_path)] = new_item.fileid
