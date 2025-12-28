@@ -69,7 +69,7 @@ class P123Disk(_PluginBase):
     # 插件版本
     plugin_version = "1.0.2"
     # 插件配置项ID前缀
-    plugin_config_prefix = "p123diskV2_"
+    plugin_config_prefix = "p123disk_"
     # 加载顺序
     plugin_order = 99
     # 可使用的用户级别
