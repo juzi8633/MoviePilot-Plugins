@@ -3,7 +3,7 @@
         "name": "123云盘储存",
         "description": "使存储支持123云盘。",
         "labels": "云盘",
-        "version": "1.2.3",
+        "version": "1.2.4",
         "release": true,
         "icon": "https://raw.githubusercontent.com/DDSRem-Dev/MoviePilot-Plugins/main/icons/P123Disk.png",
         "author": "DDSRem",
