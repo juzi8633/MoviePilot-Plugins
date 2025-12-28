@@ -3,7 +3,7 @@
         "name": "123云盘储存",
         "description": "使存储支持123云盘。",
         "labels": "云盘",
-        "version": "1.0.0",
+        "version": "1.2.6",
         "release": true,
         "icon": "https://raw.githubusercontent.com/juzi8633/MoviePilot-Plugins/main/icons/P123Disk.png",
         "author": "juzi8633",
