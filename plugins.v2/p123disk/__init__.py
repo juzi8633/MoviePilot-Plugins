@@ -67,7 +67,7 @@ class P123Disk(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/juzi8633/MoviePilot-Plugins/main/icons/P123Disk.png"
     # 插件版本
-    plugin_version = "1.2.8"
+    plugin_version = "1.2.9"
     # 插件作者
     plugin_author = "juzi8633"
     # 作者主页
@@ -90,7 +90,6 @@ class P123Disk(_PluginBase):
     # 新增配置项
     _webhook_url = None
     _webhook_secret = None
-    _slice_size = None
     _upload_threads = 3
 
     def __init__(self):
@@ -124,7 +123,6 @@ class P123Disk(_PluginBase):
             # 读取新增配置
             self._webhook_url = config.get("webhook_url")
             self._webhook_secret = config.get("webhook_secret")
-            self._slice_size = config.get("slice_size")
             self._upload_threads = config.get("upload_threads")
 
             try:
@@ -135,7 +133,6 @@ class P123Disk(_PluginBase):
                     disk_name=self._disk_name,
                     webhook_url=self._webhook_url,
                     webhook_secret=self._webhook_secret,
-                    slice_size=self._slice_size,
                     upload_threads=self._upload_threads
                 )  # noqa
             except Exception as e:
@@ -246,20 +243,6 @@ class P123Disk(_PluginBase):
                                     {
                                         "component": "VTextField",
                                         "props": {
-                                            "model": "slice_size",
-                                            "label": "分片大小(MB)",
-                                            "placeholder": "默认自动，建议 10-100",
-                                        },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 6},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
                                             "model": "upload_threads",
                                             "label": "上传并发线程数",
                                             "placeholder": "默认为3，建议1-10",
@@ -277,7 +260,6 @@ class P123Disk(_PluginBase):
             "password": "",
             "webhook_url": "",
             "webhook_secret": "",
-            "slice_size": "",
             "upload_threads": "3",
         }
 
