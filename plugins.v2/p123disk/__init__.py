@@ -1,6 +1,7 @@
 from pathlib import Path
 from typing import Any, List, Dict, Tuple, Optional
 import threading
+import time
 
 from p123client import P123Client
 from .p123_api import P123Api
@@ -16,8 +17,9 @@ from app.schemas import StorageOperSelectionEventData, FileItem
 
 class P123AutoClient:
     """
-    123云盘客户端 (线程安全版)
+    123云盘客户端 (线程安全优化版)
     """
+    _last_reset_time = 0
 
     def __init__(self, passport, password):
         self._client = None
@@ -45,9 +47,13 @@ class P123AutoClient:
             ):
                 # 获取锁，确保只有一个线程执行登录操作
                 with self._lock:
-                    # 再次检查，防止等待锁的过程中前一个线程已经修复了连接
-                    # 这里做一个简单的重新实例化，虽然有点浪费但最安全
-                    self._client = P123Client(self._passport, self._password)  # noqa
+                    # 再次检查时间戳，防止重复刷新
+                    if time.time() - self._last_reset_time < 10:
+                        logger.debug("【123】Token刷新锁定中，直接使用新实例重试")
+                    else:
+                        logger.info("【123】Token失效，执行重新登录...")
+                        self._client = P123Client(self._passport, self._password)  # noqa
+                        self._last_reset_time = time.time()
                 
                 # 获取新实例的方法
                 attr = getattr(self._client, name)
@@ -67,7 +73,7 @@ class P123Disk(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/juzi8633/MoviePilot-Plugins/main/icons/P123Disk.png"
     # 插件版本
-    plugin_version = "1.3.0"
+    plugin_version = "1.3.2"
     # 插件作者
     plugin_author = "juzi8633"
     # 作者主页

@@ -24,11 +24,14 @@ from app.utils.string import StringUtils
 class P123Api:
     """
     123云盘基础操作 (最终完整优化版)
-    集成特性：多线程、连接池、mmap、异步Webhook、指数重试、详细日志、自动分片
+    集成特性：多线程、全局连接池、mmap、异步Webhook池、指数重试、详细日志、自动分片、大文件兼容
     """
 
     # FileId和路径缓存
     _id_cache: Dict[str, str] = {}
+    
+    # Webhook 发送线程池 (限制并发，防止资源耗尽)
+    _webhook_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="P123Webhook")
 
     def __init__(self, client: P123Client, disk_name: str, 
                  webhook_url: str = None, 
@@ -49,8 +52,25 @@ class P123Api:
             if self.upload_threads > 32: self.upload_threads = 32
         except Exception:
             self.upload_threads = 3
+
+        # 初始化全局 HTTP Session (连接复用)
+        self._session = requests.Session()
+        adapter = HTTPAdapter(
+            pool_connections=self.upload_threads, 
+            pool_maxsize=self.upload_threads * 2,
+            max_retries=2
+        )
+        self._session.mount('https://', adapter)
+        self._session.mount('http://', adapter)
         
         logger.debug(f"【123】API实例初始化 | 线程: {self.upload_threads} | Webhook: {'开启' if webhook_url else '关闭'}")
+
+    def __del__(self):
+        """清理资源"""
+        try:
+            self._session.close()
+        except Exception:
+            pass
 
     def _path_to_id(self, path: str):
         """
@@ -362,7 +382,8 @@ class P123Api:
         progress_callback = transfer_process(Path(fileitem.path).as_posix())
 
         try:
-            with requests.get(download_url, stream=True) as r:
+            # 使用 session 进行下载以复用连接
+            with self._session.get(download_url, stream=True) as r:
                 r.raise_for_status()
                 downloaded_size = 0
 
@@ -389,39 +410,43 @@ class P123Api:
 
         return local_path
 
+    def _do_send_webhook_task(self, file_name, remote_path, size, etag, status, speed):
+        """
+        执行Webhook发送任务 (线程池工作函数)
+        """
+        try:
+            payload = {
+                "file_name": file_name,
+                "path": remote_path,
+                "size": size,
+                "etag": etag,
+                "secret": self.webhook_secret,
+                "status": status,
+                "speed": speed,
+                "timestamp": int(time.time())
+            }
+            
+            logger.debug(f"【123】WebHook请求Payload: {json.dumps(payload, ensure_ascii=False)}")
+            
+            resp = self._session.post(self.webhook_url, json=payload, timeout=10)
+            logger.info(f"【123】WebHook响应 [{resp.status_code}]: {resp.text[:500]}")
+            
+            if resp.status_code != 200:
+                logger.warning(f"【123】WebHook接收端返回错误: {resp.status_code}")
+        except Exception as e:
+            logger.warning(f"【123】WebHook发送失败: {e}")
+
     def _send_upload_webhook(self, file_name: str, remote_path: str, size: int, etag: str, status: str, speed: str = ""):
         """
-        发送上传完成 Webhook (异步非阻塞，带详细响应日志)
+        提交 Webhook 任务到线程池
         """
         if not self.webhook_url:
             return
 
-        def _do_send():
-            try:
-                # logger.debug(f"【123】WebHook触发 | {file_name}")
-                payload = {
-                    "file_name": file_name,
-                    "path": remote_path,
-                    "size": size,
-                    "etag": etag,
-                    "secret": self.webhook_secret,
-                    "status": status,
-                    "speed": speed,
-                    "timestamp": int(time.time())
-                }
-                
-                logger.debug(f"【123】WebHook请求Payload: {json.dumps(payload, ensure_ascii=False)}")
-                
-                resp = requests.post(self.webhook_url, json=payload, timeout=10)
-                logger.info(f"【123】WebHook响应 [{resp.status_code}]: {resp.text[:500]}")
-                
-                if resp.status_code != 200:
-                    logger.warning(f"【123】WebHook接收端返回错误: {resp.status_code}")
-            except Exception as e:
-                logger.warning(f"【123】WebHook发送失败: {e}")
-
-        # 启动守护线程
-        threading.Thread(target=_do_send, daemon=True).start()
+        self._webhook_executor.submit(
+            self._do_send_webhook_task, 
+            file_name, remote_path, size, etag, status, speed
+        )
 
     def _upload_chunk_worker(self, session, mmapped_file, slice_no, offset, size, upload_data, target_name):
         """
@@ -502,16 +527,16 @@ class P123Api:
 
         logger.info(f"【123】开始处理文件: {target_name} ({StringUtils.str_filesize(file_size)})")
 
-        # 1. 计算MD5 (带进度显示)
+        # 1. 计算MD5 (带进度显示，IO Buffer优化至 64MB)
         file_md5 = ""
         try:
             with open(local_path, "rb") as f:
                 hash_md5 = md5()
                 processed_size = 0
                 last_log_time = time.time()
+                chunk_size = 64 * 1024 * 1024 # 优化: 64MB Buffer
                 
-                # 4MB Buffer
-                for chunk in iter(lambda: f.read(4 * 1024 * 1024), b""):
+                for chunk in iter(lambda: f.read(chunk_size), b""):
                     hash_md5.update(chunk)
                     processed_size += len(chunk)
                     
@@ -580,7 +605,7 @@ class P123Api:
             return None
 
         # === 场景2：普通上传 ===
-        upload_session = requests.Session()
+        # 使用全局 Session，不再每次创建
         try:
             upload_data = resp.get("data")
             if not upload_data:
@@ -589,15 +614,6 @@ class P123Api:
                 
             slice_size = int(upload_data.get("SliceSize", 10*1024*1024))
             
-            # 配置连接池
-            adapter = HTTPAdapter(
-                pool_connections=self.upload_threads, 
-                pool_maxsize=self.upload_threads,
-                max_retries=2
-            )
-            upload_session.mount('https://', adapter)
-            upload_session.mount('http://', adapter)
-
             if file_size > slice_size:
                 logger.info(
                     f"【123】启动并发上传 | 线程: {self.upload_threads} | 分片: {StringUtils.str_filesize(slice_size)} | 总片数: {int(file_size/slice_size)+1}"
@@ -623,7 +639,7 @@ class P123Api:
                             future_to_slice = {
                                 executor.submit(
                                     self._upload_chunk_worker, 
-                                    upload_session, mmapped_file, sno, off, sz, upload_data, target_name
+                                    self._session, mmapped_file, sno, off, sz, upload_data, target_name
                                 ): sno for sno, off, sz in tasks
                             }
                             
@@ -662,7 +678,7 @@ class P123Api:
                 for i in range(3):
                     try:
                         # 小文件也使用Session复用连接
-                        resp_put = upload_session.put(
+                        resp_put = self._session.put(
                             resp["data"]["presignedUrls"]["1"],
                             data=file_data,
                             timeout=300
@@ -679,8 +695,22 @@ class P123Api:
             complete_resp = self.client.upload_complete(upload_data)
             check_response(complete_resp)
 
-            # 防御性检查
-            data = complete_resp.get("data", {}).get("file_info", {})
+            # 防御性检查与大文件兼容处理 (核心修复)
+            resp_data = complete_resp.get("data", {})
+            # 兼容逻辑：如果 data 为空但 code 为 0，视为成功
+            if (not resp_data or "file_info" not in resp_data) and complete_resp.get("code") == 0:
+                logger.warning(f"【123】上传API返回成功但无元数据(可能是大文件合并中)，手动构造成功响应: {target_name}")
+                # 手动构造返回数据，确保流程不中断
+                data = {
+                    "FileId": "", # 此时拿不到ID，但文件已入库，后续刮削会自动修正
+                    "FileName": target_name,
+                    "Type": 0, 
+                    "Size": file_size,
+                    "UpdateAt": datetime.now().isoformat()
+                }
+            else:
+                data = resp_data.get("file_info", {})
+
             if not data or "FileName" not in data:
                 logger.error(f"【123】上传完成但数据异常: {json.dumps(complete_resp, ensure_ascii=False)}")
                 return None
@@ -708,8 +738,7 @@ class P123Api:
         except Exception as e:
             logger.error(f"【123】上传流程崩溃: {e}")
             return None
-        finally:
-            upload_session.close()
+        # 全局 Session 不在此关闭，由 __del__ 或垃圾回收处理
 
     def _build_file_item(self, data, target_path):
         """
@@ -717,14 +746,14 @@ class P123Api:
         """
         return schemas.FileItem(
             storage=self._disk_name,
-            fileid=str(data["FileId"]),
-            path=str(target_path) + ("/" if data["Type"] == 0 else ""),
-            type="file" if data["Type"] == 0 else "dir",
+            fileid=str(data.get("FileId", "")), # 兼容手动构造时 FileId 可能为空
+            path=str(target_path) + ("/" if data.get("Type", 0) == 1 else ""),
+            type="file" if data.get("Type", 0) == 0 else "dir",
             name=data["FileName"],
             basename=Path(data["FileName"]).stem,
-            extension=Path(data["FileName"]).suffix[1:] if data["Type"] == 0 else None,
+            extension=Path(data["FileName"]).suffix[1:] if data.get("Type", 0) == 0 else None,
             pickcode=str(data),
-            size=data["Size"] if data["Type"] == 0 else None,
+            size=data.get("Size") if data.get("Type", 0) == 0 else None,
             modify_time=int(datetime.fromisoformat(data["UpdateAt"]).timestamp()),
         )
 
