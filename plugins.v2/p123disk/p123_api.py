@@ -3,6 +3,7 @@ import time
 import threading
 import copy
 import mmap
+import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional, List, Dict
@@ -22,7 +23,7 @@ from app.utils.string import StringUtils
 
 class P123Api:
     """
-    123云盘基础操作 (优化版)
+    123云盘基础操作 (深度日志排查版)
     """
 
     # FileId和路径缓存
@@ -45,7 +46,7 @@ class P123Api:
         try:
             self.upload_threads = int(upload_threads) if upload_threads else 3
             if self.upload_threads < 1: self.upload_threads = 1
-            if self.upload_threads > 32: self.upload_threads = 32 # 限制最大线程防止炸内存
+            if self.upload_threads > 32: self.upload_threads = 32
         except Exception:
             self.upload_threads = 3
 
@@ -402,11 +403,11 @@ class P123Api:
                 "speed": speed,
                 "timestamp": int(time.time())
             }
-            # [修改点] 捕获返回值并打印详细日志
+            # 捕获返回值并打印详细日志
             resp = requests.post(self.webhook_url, json=payload, timeout=5)
             
-            # 打印响应状态码和内容
-            logger.info(f"【123】Webhook响应: Code={resp.status_code}, Body={resp.text}")
+            # 打印响应状态码和内容，用于调试
+            logger.info(f"【123】Webhook响应: Code={resp.status_code}, Body={resp.text[:500]}") # 截取前500字符防刷屏
             
             # 如果不是200，打印警告
             if resp.status_code != 200:
@@ -453,7 +454,6 @@ class P123Api:
             except Exception as upload_err:
                 retry_count += 1
                 if retry_count < max_retries:
-                    # 仅在重试时打印日志，避免正常上传时刷屏
                     logger.warning(f"【123】{target_name} 分片{slice_no} 重试({retry_count}/{max_retries})")
                     time.sleep(3)
                     try:
@@ -473,7 +473,7 @@ class P123Api:
         new_name: Optional[str] = None,
     ) -> Optional[schemas.FileItem]:
         """
-        上传文件 (支持多线程、连接池、mmap、优化日志)
+        上传文件 (支持多线程、连接池、mmap、防御性日志)
         """
         start_time = time.time()
         target_name = new_name or local_path.name
@@ -513,9 +513,14 @@ class P123Api:
                 logger.info(f"【123】秒传成功: {target_name}")
                 data = resp.get("data", {}).get("Info", {})
                 
+                # [Fix] 防御性检查
+                if not data or "FileName" not in data:
+                     logger.error(f"【123】秒传返回数据异常(缺少FileName). 完整响应: {json.dumps(resp, ensure_ascii=False)}")
+                     return None
+
                 self._send_upload_webhook(
                     file_name=data["FileName"],
-                    remote_path=str(target_path) + ("/" if data["Type"] == 1 else ""),
+                    remote_path=str(target_path) + ("/" if data.get("Type") == 1 else ""),
                     size=file_size,
                     etag=file_md5,
                     status="rapid_upload",
@@ -530,13 +535,17 @@ class P123Api:
         # === 场景2：普通上传 ===
         upload_session = requests.Session()
         try:
-            upload_data = resp["data"]
-            slice_size = int(upload_data["SliceSize"])
+            upload_data = resp.get("data")
+            if not upload_data:
+                logger.error(f"【123】上传响应异常(无data字段). 完整响应: {json.dumps(resp, ensure_ascii=False)}")
+                return None
+                
+            slice_size = int(upload_data.get("SliceSize", 10*1024*1024))
             
             if self.target_slice_size and slice_size != self.target_slice_size:
                 logger.warning(
                     f"【123】分片设置未生效！申请: {StringUtils.str_filesize(self.target_slice_size)}, "
-                    f"服务器强制: {StringUtils.str_filesize(slice_size)} (这是123云盘API策略导致，非插件Bug)"
+                    f"服务器强制: {StringUtils.str_filesize(slice_size)}"
                 )
             
             if file_size > slice_size:
@@ -587,7 +596,7 @@ class P123Api:
                                     bytes_uploaded = future.result()
                                     downloaded_size += bytes_uploaded
                                     
-                                    # 控制台/日志心跳：每15秒打印一次进度
+                                    # 控制台/日志心跳
                                     current_time = time.time()
                                     if current_time - last_log_time > 15:
                                         percent = int((downloaded_size / file_size) * 100)
@@ -627,8 +636,13 @@ class P123Api:
             complete_resp = self.client.upload_complete(upload_data)
             check_response(complete_resp)
 
+            # [Fix] 防御性检查：防止 KeyError 'FileName'
             data = complete_resp.get("data", {}).get("file_info", {})
-            
+            if not data or "FileName" not in data:
+                # 打印详细的完整响应以便排查
+                logger.error(f"【123】上传完成但返回数据异常(缺失FileName). 完整响应: {json.dumps(complete_resp, ensure_ascii=False)}")
+                return None
+
             # 计算最终统计
             end_time = time.time()
             duration = end_time - start_time
@@ -641,7 +655,7 @@ class P123Api:
 
             self._send_upload_webhook(
                 file_name=data["FileName"],
-                remote_path=str(target_path) + ("/" if data["Type"] == 1 else ""),
+                remote_path=str(target_path) + ("/" if data.get("Type") == 1 else ""),
                 size=file_size,
                 etag=file_md5,
                 status="uploaded",
@@ -663,7 +677,7 @@ class P123Api:
         return schemas.FileItem(
             storage=self._disk_name,
             fileid=str(data["FileId"]),
-            path=str(target_path) + ("/" if data["Type"] == 1 else ""),
+            path=str(target_path) + ("/" if data["Type"] == 0 else ""), # Type 0=file, 1=dir
             type="file" if data["Type"] == 0 else "dir",
             name=data["FileName"],
             basename=Path(data["FileName"]).stem,
@@ -673,16 +687,11 @@ class P123Api:
             modify_time=int(datetime.fromisoformat(data["UpdateAt"]).timestamp()),
         )
 
+    # 以下保持不变
     def detail(self, fileitem: schemas.FileItem) -> Optional[schemas.FileItem]:
-        """
-        获取文件详情
-        """
         return self.get_item(Path(fileitem.path))
 
     def copy(self, fileitem: schemas.FileItem, path: Path, new_name: str) -> bool:
-        """
-        复制文件
-        """
         try:
             resp = self.client.fs_copy(
                 fileitem.fileid, parent_id=self._path_to_id(str(path))
@@ -692,7 +701,6 @@ class P123Api:
             new_path = Path(path) / fileitem.name
             new_item = self.get_item(new_path)
             self.rename(new_item, new_name)
-            # 更新缓存
             del self._id_cache[fileitem.path]
             rename_new_path = Path(path) / new_name
             self._id_cache[str(rename_new_path)] = new_item.fileid
@@ -701,9 +709,6 @@ class P123Api:
             return False
 
     def move(self, fileitem: schemas.FileItem, path: Path, new_name: str) -> bool:
-        """
-        移动文件
-        """
         try:
             resp = self.client.fs_move(
                 fileitem.fileid, parent_id=self._path_to_id(str(path))
@@ -713,7 +718,6 @@ class P123Api:
             new_path = Path(path) / fileitem.name
             new_item = self.get_item(new_path)
             self.rename(new_item, new_name)
-            # 更新缓存
             del self._id_cache[fileitem.path]
             rename_new_path = Path(path) / new_name
             self._id_cache[str(rename_new_path)] = new_item.fileid
