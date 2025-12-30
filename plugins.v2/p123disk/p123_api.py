@@ -4,6 +4,7 @@ import threading
 import copy
 import mmap
 import json
+import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional, List, Dict
@@ -12,6 +13,7 @@ from datetime import datetime
 
 import requests
 from requests.adapters import HTTPAdapter
+from requests.exceptions import RequestException, ReadTimeout, ConnectTimeout
 from cachetools import TTLCache 
 
 from p123client import P123Client, check_response
@@ -25,9 +27,9 @@ from app.utils.string import StringUtils
 
 class P123Api:
     """
-    123云盘基础操作 (最终完整优化版)
-    集成特性：多线程、全局连接池、mmap(带自动降级)、异步Webhook池、指数重试、详细日志、自动分片、大文件兼容
-    优化更新：TTL缓存(1小时)、动态线程策略(3/5/8)、Mmap失败自动回退
+    123云盘基础操作 (最终完整优化版 v1.4.2)
+    集成特性：多线程、全局连接池、mmap(带自动降级)、异步Webhook池、指数重试、自动分片、大文件兼容
+    优化更新：TTL缓存(1小时)、动态线程策略(3/5/8)、Mmap失败自动回退、增强日志与超时重试
     """
 
     # 【优化1：缓存策略】使用 TTLCache，最大10000条，有效期3600秒(1小时)
@@ -49,7 +51,6 @@ class P123Api:
         self.webhook_secret = webhook_secret
         
         # 处理并发线程数 (这是用户设置的"上限")
-        # 建议用户在界面上设置为 8 或 10，以便发挥大文件性能
         try:
             self.max_upload_threads = int(upload_threads) if upload_threads else 3
             if self.max_upload_threads < 1: self.max_upload_threads = 1
@@ -61,7 +62,6 @@ class P123Api:
         self._session = requests.Session()
         
         # 【优化】：连接池大小按照最大可能的线程数来设置，防止高并发时阻塞
-        # 即使只用3个线程，池子大一点也没有副作用，取最大线程数和16的较大值
         pool_size = max(self.max_upload_threads, 16)
         
         adapter = HTTPAdapter(
@@ -83,9 +83,8 @@ class P123Api:
 
     def _path_to_id(self, path: str):
         """
-        通过路径获取ID (带TTL缓存和自动驱逐)
+        通过路径获取ID (带TTL缓存和自动驱逐，增加了超时重试机制)
         """
-        # 根目录
         if path == "/":
             return "0"
         if len(path) > 1 and path.endswith("/"):
@@ -93,6 +92,7 @@ class P123Api:
             
         # 1. 检查缓存
         if path in self._id_cache:
+            # logger.debug(f"【123】缓存命中: {path} -> {self._id_cache[path]}")
             return self._id_cache[path]
             
         # 逐级查找缓存
@@ -117,6 +117,8 @@ class P123Api:
                 page = 1
                 _next = 0
                 first_find = True
+                
+                # 针对每一层目录的查找循环
                 while True:
                     payload = {
                         "limit": 100,
@@ -130,15 +132,29 @@ class P123Api:
                     else:
                         time.sleep(1)
                     
-                    try:
-                        resp = self.client.fs_list(payload)
-                        check_response(resp)
-                    except Exception as e:
-                        logger.error(f"【123】列出目录异常 (ID: {current_id}): {e}")
-                        # 【优化1：缓存驱逐】如果父目录都无法读取，可能路径已变更，清除缓存
-                        if str(parent_path) in self._id_cache:
-                             del self._id_cache[str(parent_path)]
-                        raise e
+                    # 【新增优化】目录列表请求增加重试机制 (针对 ReadTimeout)
+                    retry_list = 0
+                    max_list_retries = 3
+                    resp = None
+                    
+                    while retry_list < max_list_retries:
+                        try:
+                            resp = self.client.fs_list(payload)
+                            check_response(resp)
+                            break # 成功则跳出重试
+                        except (ReadTimeout, ConnectTimeout) as net_err:
+                            retry_list += 1
+                            logger.warning(f"【123】列出目录超时(ID:{current_id}), 重试 {retry_list}/{max_list_retries}: {net_err}")
+                            time.sleep(2)
+                        except Exception as e:
+                            # 非网络超时错误，直接抛出
+                            logger.error(f"【123】列出目录异常 (ID: {current_id}): {e}")
+                            if str(parent_path) in self._id_cache:
+                                 del self._id_cache[str(parent_path)]
+                            raise e
+                    
+                    if retry_list >= max_list_retries:
+                        raise Exception(f"列出目录失败(重试{max_list_retries}次): {current_id}")
 
                     item_list = resp.get("data").get("InfoList")
                     if not item_list:
@@ -155,10 +171,12 @@ class P123Api:
                     else:
                         page += 1
                         _next = resp.get("data").get("Next")
+                        
                 if not find_part:
                     # 【优化1：缓存驱逐】路径不存在，清除可能的错误缓存
                     if path in self._id_cache:
                         del self._id_cache[path]
+                        logger.debug(f"【123】路径不存在，清除缓存: {path}")
                     raise FileNotFoundError(f"【123】路径节点不存在: {part} (in {path})")
             
             if not current_id:
@@ -169,7 +187,7 @@ class P123Api:
             return str(current_id)
             
         except Exception as e:
-            # 发生任何未捕获异常时，尝试清理当前查询路径的缓存，防止脏数据
+            # 发生任何未捕获异常时，尝试清理当前查询路径的缓存
             if path in self._id_cache:
                 del self._id_cache[path]
             raise e
@@ -178,10 +196,6 @@ class P123Api:
         """
         【优化3：动态并发控制】
         根据文件大小动态计算并发线程数
-        策略: 
-        - < 5GB: 3 线程 (减少开销)
-        - 5GB - 10GB: 5 线程 (平衡模式)
-        - > 10GB: 8 线程 (全速模式)
         """
         gb = 1024 * 1024 * 1024
         
@@ -197,6 +211,79 @@ class P123Api:
         
         # 兜底至少 1 个线程
         return max(1, final_workers)
+
+    def _upload_chunk_worker(self, session, data_source, slice_no, offset, size, upload_data, target_name, file_lock=None):
+        """
+        分片上传的工作线程函数
+        """
+        chunk = None
+        try:
+            # 【优化2：Mmap 兼容读取】
+            if isinstance(data_source, mmap.mmap):
+                chunk = data_source[offset : offset + size]
+            else:
+                if file_lock:
+                    with file_lock:
+                        data_source.seek(offset)
+                        chunk = data_source.read(size)
+                else:
+                    logger.error("【123】普通IO模式缺少文件锁")
+                    return 0
+        except Exception as e:
+            logger.error(f"【123】读取分片数据失败(Offset:{offset}): {e}")
+            raise e
+        
+        if not chunk:
+            return 0
+
+        current_upload_data = copy.deepcopy(upload_data)
+        current_upload_data["partNumberStart"] = slice_no
+        current_upload_data["partNumberEnd"] = slice_no + 1
+
+        max_retries = 5
+        retry_count = 0
+        
+        # 获取URL (预处理阶段)
+        try:
+            current_upload_url_resp = self.client.upload_prepare(current_upload_data)
+            check_response(current_upload_url_resp)
+        except Exception as e:
+            logger.error(f"【123】获取分片上传URL失败(分片{slice_no}): {e}")
+            raise e
+
+        while retry_count < max_retries:
+            try:
+                upload_url = current_upload_url_resp["data"]["presignedUrls"][str(slice_no)]
+                
+                # 使用Session复用连接
+                resp = session.put(
+                    upload_url,
+                    data=chunk,
+                    headers={"authorization": ""},
+                    timeout=300
+                )
+                
+                if resp.status_code != 200:
+                    raise Exception(f"HTTP {resp.status_code} - {resp.text[:50]}")
+                    
+                return len(chunk)
+
+            except Exception as upload_err:
+                retry_count += 1
+                if retry_count < max_retries:
+                    wait_time = 2 ** (retry_count - 1)
+                    # 【日志优化】记录详细重试原因
+                    logger.warning(f"【123】{target_name} 分片{slice_no} 上传失败(第{retry_count}次): {upload_err} -> 等待{wait_time}s")
+                    time.sleep(wait_time)
+                    try:
+                        current_upload_url_resp = self.client.upload_prepare(current_upload_data)
+                        check_response(current_upload_url_resp)
+                    except Exception:
+                        pass
+                else:
+                    logger.error(f"【123】{target_name} 分片{slice_no} 最终失败: {upload_err}")
+                    raise upload_err
+        return 0
 
     def list(self, fileitem: schemas.FileItem) -> List[schemas.FileItem]:
         """
@@ -231,8 +318,17 @@ class P123Api:
                     first_find = False
                 else:
                     time.sleep(1)
-                resp = self.client.fs_list(payload)
-                check_response(resp)
+                
+                # 【新增优化】浏览目录也增加网络超时保护
+                try:
+                    resp = self.client.fs_list(payload)
+                    check_response(resp)
+                except (ReadTimeout, ConnectTimeout):
+                    logger.warning(f"【123】浏览目录超时，重试一次...")
+                    time.sleep(2)
+                    resp = self.client.fs_list(payload)
+                    check_response(resp)
+
                 item_list = resp.get("data").get("InfoList")
                 if not item_list:
                     break
@@ -359,7 +455,6 @@ class P123Api:
                 modify_time=int(datetime.fromisoformat(data["UpdateAt"]).timestamp()),
             )
         except Exception as e:
-            # logger.debug(f"【123】获取文件信息失败: {str(e)}")
             return None
 
     def get_parent(self, fileitem: schemas.FileItem) -> Optional[schemas.FileItem]:
@@ -503,84 +598,6 @@ class P123Api:
             file_name, remote_path, size, etag, status, speed
         )
 
-    def _upload_chunk_worker(self, session, data_source, slice_no, offset, size, upload_data, target_name, file_lock=None):
-        """
-        分片上传的工作线程函数 (mmap + 指数重试 + 连接池 + 锁兼容)
-        data_source: mmap对象 或 file对象
-        file_lock: 如果 data_source 是 file 对象，必须传入 lock
-        """
-        chunk = None
-        try:
-            # 【优化2：Mmap 兼容读取】
-            if isinstance(data_source, mmap.mmap):
-                # mmap 是线程安全的切片读取，无需锁
-                chunk = data_source[offset : offset + size]
-            else:
-                # 普通文件对象降级模式，必须加锁 seek，否则多线程读会乱
-                if file_lock:
-                    with file_lock:
-                        data_source.seek(offset)
-                        chunk = data_source.read(size)
-                else:
-                    logger.error("【123】普通IO模式缺少文件锁")
-                    return 0
-        except Exception as e:
-            logger.error(f"【123】读取分片数据失败(Offset:{offset}): {e}")
-            raise e
-        
-        if not chunk:
-            return 0
-
-        current_upload_data = copy.deepcopy(upload_data)
-        current_upload_data["partNumberStart"] = slice_no
-        current_upload_data["partNumberEnd"] = slice_no + 1
-
-        max_retries = 5
-        retry_count = 0
-        
-        # 获取URL (预处理阶段)
-        try:
-            current_upload_url_resp = self.client.upload_prepare(current_upload_data)
-            check_response(current_upload_url_resp)
-        except Exception as e:
-            logger.error(f"【123】获取分片上传URL失败(分片{slice_no}): {e}")
-            raise e
-
-        while retry_count < max_retries:
-            try:
-                upload_url = current_upload_url_resp["data"]["presignedUrls"][str(slice_no)]
-                
-                # 使用Session复用连接
-                resp = session.put(
-                    upload_url,
-                    data=chunk,
-                    headers={"authorization": ""},
-                    timeout=300
-                )
-                
-                if resp.status_code != 200:
-                    raise Exception(f"HTTP {resp.status_code} - {resp.text[:50]}")
-                    
-                return len(chunk)
-
-            except Exception as upload_err:
-                retry_count += 1
-                if retry_count < max_retries:
-                    # 指数退避：1s, 2s, 4s, 8s
-                    wait_time = 2 ** (retry_count - 1)
-                    # logger.warning(f"【123】{target_name} 分片{slice_no} 重试({retry_count}/{max_retries}) 等待{wait_time}s")
-                    time.sleep(wait_time)
-                    try:
-                        # 重新获取URL防止过期
-                        current_upload_url_resp = self.client.upload_prepare(current_upload_data)
-                        check_response(current_upload_url_resp)
-                    except Exception:
-                        pass
-                else:
-                    logger.error(f"【123】{target_name} 分片{slice_no} 最终失败: {upload_err}")
-                    raise upload_err
-        return 0
-
     def upload(
         self,
         target_dir: schemas.FileItem,
@@ -619,6 +636,7 @@ class P123Api:
                 file_md5 = hash_md5.hexdigest()
         except Exception as e:
             logger.error(f"【123】文件读取/MD5失败: {e}")
+            logger.debug(traceback.format_exc()) # 【日志优化】打印堆栈
             return None
 
         try:
@@ -834,6 +852,7 @@ class P123Api:
 
         except Exception as e:
             logger.error(f"【123】上传流程崩溃: {e}")
+            logger.debug(traceback.format_exc()) # 【日志优化】打印堆栈
             return None
         # 全局 Session 不在此关闭，由 __del__ 或垃圾回收处理
 
