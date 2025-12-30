@@ -12,6 +12,8 @@ from datetime import datetime
 
 import requests
 from requests.adapters import HTTPAdapter
+from cachetools import TTLCache 
+
 from p123client import P123Client, check_response
 
 from app import schemas
@@ -24,11 +26,15 @@ from app.utils.string import StringUtils
 class P123Api:
     """
     123云盘基础操作 (最终完整优化版)
-    集成特性：多线程、连接池、mmap、异步Webhook、指数重试、详细日志、自动分片
+    集成特性：多线程、全局连接池、mmap(带自动降级)、异步Webhook池、指数重试、详细日志、自动分片、大文件兼容
+    优化更新：TTL缓存(1小时)、动态线程策略(3/5/8)、Mmap失败自动回退
     """
 
-    # FileId和路径缓存
-    _id_cache: Dict[str, str] = {}
+    # 【优化1：缓存策略】使用 TTLCache，最大10000条，有效期3600秒(1小时)
+    _id_cache = TTLCache(maxsize=10000, ttl=3600)
+    
+    # Webhook 发送线程池 (限制并发，防止资源耗尽)
+    _webhook_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="P123Webhook")
 
     def __init__(self, client: P123Client, disk_name: str, 
                  webhook_url: str = None, 
@@ -42,26 +48,50 @@ class P123Api:
         self.webhook_url = webhook_url
         self.webhook_secret = webhook_secret
         
-        # 处理并发线程数 (默认3，最大32)
+        # 处理并发线程数 (这是用户设置的"上限")
+        # 建议用户在界面上设置为 8 或 10，以便发挥大文件性能
         try:
-            self.upload_threads = int(upload_threads) if upload_threads else 3
-            if self.upload_threads < 1: self.upload_threads = 1
-            if self.upload_threads > 32: self.upload_threads = 32
+            self.max_upload_threads = int(upload_threads) if upload_threads else 3
+            if self.max_upload_threads < 1: self.max_upload_threads = 1
+            if self.max_upload_threads > 32: self.max_upload_threads = 32
         except Exception:
-            self.upload_threads = 3
+            self.max_upload_threads = 3
+
+        # 初始化全局 HTTP Session (连接复用)
+        self._session = requests.Session()
         
-        logger.debug(f"【123】API实例初始化 | 线程: {self.upload_threads} | Webhook: {'开启' if webhook_url else '关闭'}")
+        # 【优化】：连接池大小按照最大可能的线程数来设置，防止高并发时阻塞
+        # 即使只用3个线程，池子大一点也没有副作用，取最大线程数和16的较大值
+        pool_size = max(self.max_upload_threads, 16)
+        
+        adapter = HTTPAdapter(
+            pool_connections=pool_size, 
+            pool_maxsize=pool_size * 2,
+            max_retries=2
+        )
+        self._session.mount('https://', adapter)
+        self._session.mount('http://', adapter)
+        
+        logger.debug(f"【123】API实例初始化 | 线程上限: {self.max_upload_threads} | 连接池: {pool_size} | Webhook: {'开启' if webhook_url else '关闭'}")
+
+    def __del__(self):
+        """清理资源"""
+        try:
+            self._session.close()
+        except Exception:
+            pass
 
     def _path_to_id(self, path: str):
         """
-        通过路径获取ID (带缓存)
+        通过路径获取ID (带TTL缓存和自动驱逐)
         """
         # 根目录
         if path == "/":
             return "0"
         if len(path) > 1 and path.endswith("/"):
             path = path[:-1]
-        # 检查缓存
+            
+        # 1. 检查缓存
         if path in self._id_cache:
             return self._id_cache[path]
             
@@ -74,62 +104,99 @@ class P123Api:
                 current_id = self._id_cache[parent_path]
                 break
         
-        # 计算相对路径
         try:
-            rel_path = Path(path).relative_to(parent_path)
-        except ValueError:
-            current_id = 0
-            rel_path = Path(path).relative_to("/")
+            # 计算相对路径
+            try:
+                rel_path = Path(path).relative_to(parent_path)
+            except ValueError:
+                current_id = 0
+                rel_path = Path(path).relative_to("/")
 
-        for part in Path(rel_path).parts:
-            find_part = False
-            page = 1
-            _next = 0
-            first_find = True
-            while True:
-                payload = {
-                    "limit": 100,
-                    "next": _next,
-                    "Page": page,
-                    "parentFileId": int(current_id),
-                    "inDirectSpace": "false",
-                }
-                if first_find:
-                    first_find = False
-                else:
-                    time.sleep(1)
-                
-                try:
-                    resp = self.client.fs_list(payload)
-                    check_response(resp)
-                except Exception as e:
-                    logger.error(f"【123】列出目录异常 (ID: {current_id}): {e}")
-                    raise e
+            for part in Path(rel_path).parts:
+                find_part = False
+                page = 1
+                _next = 0
+                first_find = True
+                while True:
+                    payload = {
+                        "limit": 100,
+                        "next": _next,
+                        "Page": page,
+                        "parentFileId": int(current_id),
+                        "inDirectSpace": "false",
+                    }
+                    if first_find:
+                        first_find = False
+                    else:
+                        time.sleep(1)
+                    
+                    try:
+                        resp = self.client.fs_list(payload)
+                        check_response(resp)
+                    except Exception as e:
+                        logger.error(f"【123】列出目录异常 (ID: {current_id}): {e}")
+                        # 【优化1：缓存驱逐】如果父目录都无法读取，可能路径已变更，清除缓存
+                        if str(parent_path) in self._id_cache:
+                             del self._id_cache[str(parent_path)]
+                        raise e
 
-                item_list = resp.get("data").get("InfoList")
-                if not item_list:
-                    break
-                for item in item_list:
-                    if item["FileName"] == part:
-                        current_id = item["FileId"]
-                        find_part = True
+                    item_list = resp.get("data").get("InfoList")
+                    if not item_list:
                         break
-                if find_part:
-                    break
-                if resp.get("data").get("Next") == "-1":
-                    break
-                else:
-                    page += 1
-                    _next = resp.get("data").get("Next")
-            if not find_part:
-                raise FileNotFoundError(f"【123】路径节点不存在: {part} (in {path})")
-        
-        if not current_id:
-            raise FileNotFoundError(f"【123】路径不存在: {path}")
+                    for item in item_list:
+                        if item["FileName"] == part:
+                            current_id = item["FileId"]
+                            find_part = True
+                            break
+                    if find_part:
+                        break
+                    if resp.get("data").get("Next") == "-1":
+                        break
+                    else:
+                        page += 1
+                        _next = resp.get("data").get("Next")
+                if not find_part:
+                    # 【优化1：缓存驱逐】路径不存在，清除可能的错误缓存
+                    if path in self._id_cache:
+                        del self._id_cache[path]
+                    raise FileNotFoundError(f"【123】路径节点不存在: {part} (in {path})")
             
-        # 缓存路径
-        self._id_cache[path] = str(current_id)
-        return str(current_id)
+            if not current_id:
+                raise FileNotFoundError(f"【123】路径不存在: {path}")
+                
+            # 缓存路径
+            self._id_cache[path] = str(current_id)
+            return str(current_id)
+            
+        except Exception as e:
+            # 发生任何未捕获异常时，尝试清理当前查询路径的缓存，防止脏数据
+            if path in self._id_cache:
+                del self._id_cache[path]
+            raise e
+
+    def _get_dynamic_workers(self, file_size: int) -> int:
+        """
+        【优化3：动态并发控制】
+        根据文件大小动态计算并发线程数
+        策略: 
+        - < 5GB: 3 线程 (减少开销)
+        - 5GB - 10GB: 5 线程 (平衡模式)
+        - > 10GB: 8 线程 (全速模式)
+        """
+        gb = 1024 * 1024 * 1024
+        
+        if file_size < 5 * gb:
+            workers = 3
+        elif file_size < 10 * gb:
+            workers = 5
+        else:
+            workers = 8
+            
+        # 始终受限于用户设置的全局最大值 (防止低配机器崩溃)
+        final_workers = min(workers, self.max_upload_threads)
+        
+        # 兜底至少 1 个线程
+        return max(1, final_workers)
 
     def list(self, fileitem: schemas.FileItem) -> List[schemas.FileItem]:
         """
@@ -171,6 +238,7 @@ class P123Api:
                     break
                 for item in item_list:
                     path = f"{fileitem.path}{item['FileName']}"
+                    # 更新缓存
                     self._id_cache[path] = str(item["FileId"])
 
                     file_path = path + ("/" if item["Type"] == 1 else "")
@@ -217,6 +285,7 @@ class P123Api:
             check_response(resp)
             
             data = resp["data"]["Info"]
+            # 写入缓存
             self._id_cache[str(new_path)] = str(data["FileId"])
             
             return schemas.FileItem(
@@ -307,6 +376,9 @@ class P123Api:
             logger.info(f"【123】正在删除: {fileitem.path}")
             resp = self.client.fs_trash(int(fileitem.fileid), event="intoRecycle")
             check_response(resp)
+            # 主动清理缓存
+            if fileitem.path in self._id_cache:
+                del self._id_cache[fileitem.path]
             return True
         except Exception as e:
             logger.error(f"【123】删除失败: {e}")
@@ -325,6 +397,9 @@ class P123Api:
             }
             resp = self.client.fs_rename(payload)
             check_response(resp)
+            # 清理旧缓存
+            if fileitem.path in self._id_cache:
+                del self._id_cache[fileitem.path]
             return True
         except Exception as e:
             logger.error(f"【123】重命名失败: {e}")
@@ -362,7 +437,8 @@ class P123Api:
         progress_callback = transfer_process(Path(fileitem.path).as_posix())
 
         try:
-            with requests.get(download_url, stream=True) as r:
+            # 使用 session 进行下载以复用连接
+            with self._session.get(download_url, stream=True) as r:
                 r.raise_for_status()
                 downloaded_size = 0
 
@@ -389,48 +465,67 @@ class P123Api:
 
         return local_path
 
+    def _do_send_webhook_task(self, file_name, remote_path, size, etag, status, speed):
+        """
+        执行Webhook发送任务 (线程池工作函数)
+        """
+        try:
+            payload = {
+                "file_name": file_name,
+                "path": remote_path,
+                "size": size,
+                "etag": etag,
+                "secret": self.webhook_secret,
+                "status": status,
+                "speed": speed,
+                "timestamp": int(time.time())
+            }
+            
+            logger.debug(f"【123】WebHook请求Payload: {json.dumps(payload, ensure_ascii=False)}")
+            
+            resp = self._session.post(self.webhook_url, json=payload, timeout=10)
+            logger.info(f"【123】WebHook响应 [{resp.status_code}]: {resp.text[:500]}")
+            
+            if resp.status_code != 200:
+                logger.warning(f"【123】WebHook接收端返回错误: {resp.status_code}")
+        except Exception as e:
+            logger.warning(f"【123】WebHook发送失败: {e}")
+
     def _send_upload_webhook(self, file_name: str, remote_path: str, size: int, etag: str, status: str, speed: str = ""):
         """
-        发送上传完成 Webhook (异步非阻塞，带详细响应日志)
+        提交 Webhook 任务到线程池
         """
         if not self.webhook_url:
             return
 
-        def _do_send():
-            try:
-                # logger.debug(f"【123】WebHook触发 | {file_name}")
-                payload = {
-                    "file_name": file_name,
-                    "path": remote_path,
-                    "size": size,
-                    "etag": etag,
-                    "secret": self.webhook_secret,
-                    "status": status,
-                    "speed": speed,
-                    "timestamp": int(time.time())
-                }
-                
-                logger.debug(f"【123】WebHook请求Payload: {json.dumps(payload, ensure_ascii=False)}")
-                
-                resp = requests.post(self.webhook_url, json=payload, timeout=10)
-                logger.info(f"【123】WebHook响应 [{resp.status_code}]: {resp.text[:500]}")
-                
-                if resp.status_code != 200:
-                    logger.warning(f"【123】WebHook接收端返回错误: {resp.status_code}")
-            except Exception as e:
-                logger.warning(f"【123】WebHook发送失败: {e}")
+        self._webhook_executor.submit(
+            self._do_send_webhook_task, 
+            file_name, remote_path, size, etag, status, speed
+        )
 
-        # 启动守护线程
-        threading.Thread(target=_do_send, daemon=True).start()
-
-    def _upload_chunk_worker(self, session, mmapped_file, slice_no, offset, size, upload_data, target_name):
+    def _upload_chunk_worker(self, session, data_source, slice_no, offset, size, upload_data, target_name, file_lock=None):
         """
-        分片上传的工作线程函数 (mmap + 指数重试 + 连接池)
+        分片上传的工作线程函数 (mmap + 指数重试 + 连接池 + 锁兼容)
+        data_source: mmap对象 或 file对象
+        file_lock: 如果 data_source 是 file 对象，必须传入 lock
         """
+        chunk = None
         try:
-            chunk = mmapped_file[offset : offset + size]
+            # 【优化2：Mmap 兼容读取】
+            if isinstance(data_source, mmap.mmap):
+                # mmap 是线程安全的切片读取，无需锁
+                chunk = data_source[offset : offset + size]
+            else:
+                # 普通文件对象降级模式，必须加锁 seek，否则多线程读会乱
+                if file_lock:
+                    with file_lock:
+                        data_source.seek(offset)
+                        chunk = data_source.read(size)
+                else:
+                    logger.error("【123】普通IO模式缺少文件锁")
+                    return 0
         except Exception as e:
-            logger.error(f"【123】mmap读取失败(Offset:{offset}): {e}")
+            logger.error(f"【123】读取分片数据失败(Offset:{offset}): {e}")
             raise e
         
         if not chunk:
@@ -473,7 +568,7 @@ class P123Api:
                 if retry_count < max_retries:
                     # 指数退避：1s, 2s, 4s, 8s
                     wait_time = 2 ** (retry_count - 1)
-                    logger.warning(f"【123】{target_name} 分片{slice_no} 重试({retry_count}/{max_retries}) 等待{wait_time}s")
+                    # logger.warning(f"【123】{target_name} 分片{slice_no} 重试({retry_count}/{max_retries}) 等待{wait_time}s")
                     time.sleep(wait_time)
                     try:
                         # 重新获取URL防止过期
@@ -493,7 +588,7 @@ class P123Api:
         new_name: Optional[str] = None,
     ) -> Optional[schemas.FileItem]:
         """
-        上传文件 (全功能：秒传检测+断点续传+详细日志+异常修复)
+        上传文件 (全功能：秒传检测+断点续传+详细日志+异常修复+动态线程+Mmap回退)
         """
         start_time = time.time()
         target_name = new_name or local_path.name
@@ -502,16 +597,16 @@ class P123Api:
 
         logger.info(f"【123】开始处理文件: {target_name} ({StringUtils.str_filesize(file_size)})")
 
-        # 1. 计算MD5 (带进度显示)
+        # 1. 计算MD5 (带进度显示，IO Buffer优化至 64MB)
         file_md5 = ""
         try:
             with open(local_path, "rb") as f:
                 hash_md5 = md5()
                 processed_size = 0
                 last_log_time = time.time()
+                chunk_size = 64 * 1024 * 1024 # 优化: 64MB Buffer
                 
-                # 4MB Buffer
-                for chunk in iter(lambda: f.read(4 * 1024 * 1024), b""):
+                for chunk in iter(lambda: f.read(chunk_size), b""):
                     hash_md5.update(chunk)
                     processed_size += len(chunk)
                     
@@ -572,15 +667,12 @@ class P123Api:
                 )
                 return self._build_file_item(data, target_path)
             
-            # 普通上传分支日志
-            # logger.info(f"【123】秒传未命中，进入普通上传...")
-
         except Exception as e:
             logger.error(f"【123】秒传/预检查失败: {e}")
             return None
 
         # === 场景2：普通上传 ===
-        upload_session = requests.Session()
+        # 使用全局 Session，不再每次创建
         try:
             upload_data = resp.get("data")
             if not upload_data:
@@ -589,18 +681,12 @@ class P123Api:
                 
             slice_size = int(upload_data.get("SliceSize", 10*1024*1024))
             
-            # 配置连接池
-            adapter = HTTPAdapter(
-                pool_connections=self.upload_threads, 
-                pool_maxsize=self.upload_threads,
-                max_retries=2
-            )
-            upload_session.mount('https://', adapter)
-            upload_session.mount('http://', adapter)
-
             if file_size > slice_size:
+                # 【优化3：动态线程计算】
+                current_workers = self._get_dynamic_workers(file_size)
+
                 logger.info(
-                    f"【123】启动并发上传 | 线程: {self.upload_threads} | 分片: {StringUtils.str_filesize(slice_size)} | 总片数: {int(file_size/slice_size)+1}"
+                    f"【123】启动并发上传 | 线程: {current_workers} (上限{self.max_upload_threads}) | 分片: {StringUtils.str_filesize(slice_size)} | 总片数: {int(file_size/slice_size)+1}"
                 )
                 
                 progress_callback = transfer_process(local_path.as_posix())
@@ -617,38 +703,65 @@ class P123Api:
                 downloaded_size = 0
                 last_log_time = 0 
                 
-                with open(local_path, "rb") as f:
-                    with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mmapped_file:
-                        with ThreadPoolExecutor(max_workers=self.upload_threads) as executor:
-                            future_to_slice = {
-                                executor.submit(
-                                    self._upload_chunk_worker, 
-                                    upload_session, mmapped_file, sno, off, sz, upload_data, target_name
-                                ): sno for sno, off, sz in tasks
-                            }
-                            
-                            for future in as_completed(future_to_slice):
-                                if global_vars.is_transfer_stopped(local_path.as_posix()):
-                                    logger.warning(f"【123】上传被人为终止: {target_name}")
-                                    executor.shutdown(wait=False)
-                                    return None
-                                
-                                try:
-                                    bytes_uploaded = future.result()
-                                    downloaded_size += bytes_uploaded
-                                    
-                                    # 上传心跳 (每15秒)
-                                    current_time = time.time()
-                                    if current_time - last_log_time > 15:
-                                        percent = int((downloaded_size / file_size) * 100)
-                                        logger.info(f"【123】上传进度: {percent}% ({StringUtils.str_filesize(downloaded_size)}/{StringUtils.str_filesize(file_size)})")
-                                        last_log_time = current_time
+                # 【优化2：Mmap 兼容性回退逻辑】
+                use_mmap = True
+                f = open(local_path, "rb")
+                mmapped_file = None
+                file_lock = None
+                
+                try:
+                    # 尝试 mmap
+                    try:
+                        mmapped_file = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+                    except (ValueError, OSError) as mmap_err:
+                        # mmap 失败，降级为普通IO
+                        logger.warning(f"【123】mmap映射失败({mmap_err})，降级为普通IO模式(可能会变慢)")
+                        use_mmap = False
+                        file_lock = threading.Lock() # 普通IO多线程读文件需要锁
+                        f.seek(0) # 重置指针
 
-                                    if file_size:
-                                        progress_callback((downloaded_size * 100) / file_size)
-                                except Exception as e:
-                                    logger.error(f"【123】分片线程异常: {e}")
-                                    raise e
+                    data_source = mmapped_file if use_mmap else f
+                    
+                    with ThreadPoolExecutor(max_workers=current_workers) as executor:
+                        future_to_slice = {
+                            executor.submit(
+                                self._upload_chunk_worker, 
+                                self._session, 
+                                data_source, # 传入数据源(mmap对象 或 file对象)
+                                sno, off, sz, 
+                                upload_data, target_name,
+                                file_lock # 传入锁(如果是mmap则为None)
+                            ): sno for sno, off, sz in tasks
+                        }
+                        
+                        for future in as_completed(future_to_slice):
+                            if global_vars.is_transfer_stopped(local_path.as_posix()):
+                                logger.warning(f"【123】上传被人为终止: {target_name}")
+                                executor.shutdown(wait=False)
+                                return None
+                            
+                            try:
+                                bytes_uploaded = future.result()
+                                downloaded_size += bytes_uploaded
+                                
+                                # 上传心跳 (每15秒)
+                                current_time = time.time()
+                                if current_time - last_log_time > 15:
+                                    percent = int((downloaded_size / file_size) * 100)
+                                    logger.info(f"【123】上传进度: {percent}% ({StringUtils.str_filesize(downloaded_size)}/{StringUtils.str_filesize(file_size)})")
+                                    last_log_time = current_time
+
+                                if file_size:
+                                    progress_callback((downloaded_size * 100) / file_size)
+                            except Exception as e:
+                                logger.error(f"【123】分片线程异常: {e}")
+                                raise e
+                finally:
+                    # 清理资源
+                    if mmapped_file:
+                        mmapped_file.close()
+                    if f:
+                        f.close()
 
                 progress_callback(100)
             else:
@@ -662,7 +775,7 @@ class P123Api:
                 for i in range(3):
                     try:
                         # 小文件也使用Session复用连接
-                        resp_put = upload_session.put(
+                        resp_put = self._session.put(
                             resp["data"]["presignedUrls"]["1"],
                             data=file_data,
                             timeout=300
@@ -679,8 +792,22 @@ class P123Api:
             complete_resp = self.client.upload_complete(upload_data)
             check_response(complete_resp)
 
-            # 防御性检查
-            data = complete_resp.get("data", {}).get("file_info", {})
+            # 防御性检查与大文件兼容处理 (核心修复)
+            resp_data = complete_resp.get("data", {})
+            # 兼容逻辑：如果 data 为空但 code 为 0，视为成功
+            if (not resp_data or "file_info" not in resp_data) and complete_resp.get("code") == 0:
+                logger.warning(f"【123】上传API返回成功但无元数据(可能是大文件合并中)，手动构造成功响应: {target_name}")
+                # 手动构造返回数据，确保流程不中断
+                data = {
+                    "FileId": "", # 此时拿不到ID，但文件已入库，后续刮削会自动修正
+                    "FileName": target_name,
+                    "Type": 0, 
+                    "Size": file_size,
+                    "UpdateAt": datetime.now().isoformat()
+                }
+            else:
+                data = resp_data.get("file_info", {})
+
             if not data or "FileName" not in data:
                 logger.error(f"【123】上传完成但数据异常: {json.dumps(complete_resp, ensure_ascii=False)}")
                 return None
@@ -708,27 +835,8 @@ class P123Api:
         except Exception as e:
             logger.error(f"【123】上传流程崩溃: {e}")
             return None
-        finally:
-            upload_session.close()
+        # 全局 Session 不在此关闭，由 __del__ 或垃圾回收处理
 
-    def _build_file_item(self, data, target_path):
-        """
-        构造返回对象
-        """
-        return schemas.FileItem(
-            storage=self._disk_name,
-            fileid=str(data["FileId"]),
-            path=str(target_path) + ("/" if data["Type"] == 0 else ""),
-            type="file" if data["Type"] == 0 else "dir",
-            name=data["FileName"],
-            basename=Path(data["FileName"]).stem,
-            extension=Path(data["FileName"]).suffix[1:] if data["Type"] == 0 else None,
-            pickcode=str(data),
-            size=data["Size"] if data["Type"] == 0 else None,
-            modify_time=int(datetime.fromisoformat(data["UpdateAt"]).timestamp()),
-        )
-
-    # 以下为保留方法
     def detail(self, fileitem: schemas.FileItem) -> Optional[schemas.FileItem]:
         return self.get_item(Path(fileitem.path))
 
@@ -785,3 +893,20 @@ class P123Api:
             )
         except Exception:
             return None
+
+    def _build_file_item(self, data, target_path):
+        """
+        构造返回对象
+        """
+        return schemas.FileItem(
+            storage=self._disk_name,
+            fileid=str(data.get("FileId", "")), # 兼容手动构造时 FileId 可能为空
+            path=str(target_path) + ("/" if data.get("Type", 0) == 1 else ""),
+            type="file" if data.get("Type", 0) == 0 else "dir",
+            name=data["FileName"],
+            basename=Path(data["FileName"]).stem,
+            extension=Path(data["FileName"]).suffix[1:] if data.get("Type", 0) == 0 else None,
+            pickcode=str(data),
+            size=data.get("Size") if data.get("Type", 0) == 0 else None,
+            modify_time=int(datetime.fromisoformat(data["UpdateAt"]).timestamp()),
+        )
