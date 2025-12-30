@@ -67,13 +67,13 @@ class P123AutoClient:
 
 class P123Disk(_PluginBase):
     # 插件名称
-    plugin_name = "123云盘储存"
+    plugin_name = "123云盘储(自用版)"
     # 插件描述
-    plugin_desc = "使存储支持123云盘 (高性能优化版)。"
+    plugin_desc = "使存储支持123云盘。"
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/juzi8633/MoviePilot-Plugins/main/icons/P123Disk.png"
     # 插件版本
-    plugin_version = "1.3.7"
+    plugin_version = "1.3.9"
     # 插件作者
     plugin_author = "juzi8633"
     # 作者主页
@@ -97,6 +97,19 @@ class P123Disk(_PluginBase):
     _webhook_url = None
     _webhook_secret = None
     _upload_threads = 8 # 默认值提高以适应新策略
+
+    # 【新增优化】定义需要忽略的临时文件后缀列表
+    # 包括: qBittorrent, Transmission, Aria2, IDM, Chrome/Edge CRDOWNLOAD, 通用临时文件
+    _IGNORED_SUFFIXES = (
+        '.!qB',       # qBittorrent
+        '.part',      # Transmission / General
+        '.aria2',     # Aria2
+        '.tmp',       # General temp
+        '.downloading', 
+        '.crdownload', # Chrome/Edge
+        '.log',        # 某些情况不需要传日志
+        '.ds_store'    # Mac系统文件
+    )
 
     def __init__(self):
         """
@@ -256,7 +269,7 @@ class P123Disk(_PluginBase):
                                         "props": {
                                             "model": "upload_threads",
                                             "label": "最大并发线程上限",
-                                            "placeholder": "建议设置8-16。程序将根据文件大小自动调节(小文件3-大文件8)",
+                                            "placeholder": "建议设置8-16。程序将根据文件大小自动调节(小文件3/大文件8)",
                                         },
                                     }
                                 ],
@@ -367,8 +380,29 @@ class P123Disk(_PluginBase):
     def upload_file(
         self, fileitem: schemas.FileItem, path: Path, new_name: Optional[str] = None
     ) -> Optional[schemas.FileItem]:
+        """
+        上传文件 (增加临时文件过滤)
+        """
         if fileitem.storage != self._disk_name:
             return None
+            
+        # 【新增优化】检查是否为下载中的临时文件
+        # 获取文件名（如果有 new_name 用 new_name，否则用本地路径的文件名）
+        check_name = new_name if new_name else path.name
+        
+        # 统一转为小写进行比对，防止大小写差异
+        lower_name = check_name.lower()
+        
+        if any(lower_name.endswith(suffix.lower()) for suffix in self._IGNORED_SUFFIXES):
+            logger.info(f"【123】跳过下载中/临时文件: {check_name}")
+            # 返回 None 表示未执行上传，MoviePilot 会认为处理完成或跳过
+            return None
+            
+        # 额外的防御：忽略以 . 开头的隐藏文件 (如 .DS_Store)
+        if check_name.startswith('.'):
+             logger.debug(f"【123】跳过隐藏文件: {check_name}")
+             return None
+
         return self._p123_api.upload(fileitem, path, new_name)
 
     def delete_file(self, fileitem: schemas.FileItem) -> Optional[bool]:
