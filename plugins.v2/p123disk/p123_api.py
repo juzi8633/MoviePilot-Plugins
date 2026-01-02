@@ -200,11 +200,11 @@ class P123Api:
         gb = 1024 * 1024 * 1024
         
         if file_size < 5 * gb:
-            workers = 3
-        elif file_size < 10 * gb:
             workers = 5
+        elif file_size < 10 * gb:
+            workers = 7
         else:
-            workers = 8
+            workers = 9
             
         # 始终受限于用户设置的全局最大值 (防止低配机器崩溃)
         final_workers = min(workers, self.max_upload_threads)
