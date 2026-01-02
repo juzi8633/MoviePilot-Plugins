@@ -28,12 +28,9 @@ from app.utils.string import StringUtils
 
 class P123Api:
     """
-    123云盘基础操作 (最终完整修复版 v1.4.4)
+    123云盘基础操作 (旗舰修复版 v1.4.6)
     集成特性：多线程、全局连接池、mmap(带自动降级)、异步Webhook池、指数重试、自动分片、大文件兼容
-    修复记录：
-    1. _id_cache 改为实例属性，解决多账号缓存冲突
-    2. Webhook 日志移除 secret 明文
-    3. 分片上传修正为调用 upload_auth 并补充 partNumber
+    日志增强：Trace ID、API耗时监控、分片级详细日志
     """
 
     # Webhook 发送线程池 (限制并发，防止资源耗尽)
@@ -85,6 +82,34 @@ class P123Api:
         except Exception:
             pass
 
+    def _call_api_with_log(self, api_name: str, func, *args, **kwargs):
+        """
+        [新增优化] API调用日志切面：记录耗时、状态和潜在错误
+        """
+        start_ts = time.time()
+        try:
+            # logger.debug(f"【123】>>> 请求 [{api_name}]") # 可选：开启会非常详细
+            resp = func(*args, **kwargs)
+            cost = (time.time() - start_ts) * 1000  # 毫秒
+            
+            # 如果是 requests/httpx 的 response 对象
+            status = getattr(resp, "status_code", "Unknown")
+            # 如果是字典(SDK返回)
+            if isinstance(resp, dict):
+                status = resp.get("code", "OK")
+            
+            # 记录慢请求 (超过2秒视为慢)
+            if cost > 2000:
+                logger.warning(f"【123】<<< 响应 [{api_name}] 慢请求! 耗时: {cost:.0f}ms | 状态: {status}")
+            else:
+                logger.debug(f"【123】<<< 响应 [{api_name}] 耗时: {cost:.0f}ms | 状态: {status}")
+                
+            return resp
+        except Exception as e:
+            cost = (time.time() - start_ts) * 1000
+            logger.error(f"【123】<<< 异常 [{api_name}] 耗时: {cost:.0f}ms | 错误: {str(e)}")
+            raise e
+
     def _path_to_id(self, path: str):
         """
         通过路径获取ID (带TTL缓存和自动驱逐，增加了超时重试机制)
@@ -96,7 +121,6 @@ class P123Api:
             
         # 1. 检查缓存
         if path in self._id_cache:
-            # logger.debug(f"【123】缓存命中: {path} -> {self._id_cache[path]}")
             return self._id_cache[path]
             
         # 逐级查找缓存
@@ -143,6 +167,8 @@ class P123Api:
                     
                     while retry_list < max_list_retries:
                         try:
+                            # 增加日志
+                            logger.debug(f"【123】遍历目录 ID:{current_id} | 寻找: {part} | Page: {page}")
                             resp = self.client.fs_list(payload)
                             check_response(resp)
                             break # 成功则跳出重试
@@ -248,10 +274,18 @@ class P123Api:
         max_retries = 5
         retry_count = 0
         
+        # [新增日志] 分片开始
+        # logger.debug(f"【123】[分片{slice_no}] 准备获取上传链接...")
+
         # 获取URL (预处理阶段)
         try:
             # 【修复3】修正方法名为 upload_auth
-            current_upload_url_resp = self.client.upload_auth(current_upload_data)
+            # 使用 _call_api_with_log 记录耗时
+            current_upload_url_resp = self._call_api_with_log(
+                f"GetUrl-{slice_no}", 
+                self.client.upload_auth, 
+                current_upload_data
+            )
             check_response(current_upload_url_resp)
         except Exception as e:
             logger.error(f"【123】获取分片上传URL失败(分片{slice_no}): {e}")
@@ -261,6 +295,7 @@ class P123Api:
             try:
                 upload_url = current_upload_url_resp["data"]["presignedUrls"][str(slice_no)]
                 
+                start_put = time.time()
                 # 使用Session复用连接
                 resp = session.put(
                     upload_url,
@@ -268,10 +303,13 @@ class P123Api:
                     headers={"authorization": ""},
                     timeout=300
                 )
+                cost = time.time() - start_put
                 
                 if resp.status_code != 200:
-                    raise Exception(f"HTTP {resp.status_code} - {resp.text[:50]}")
+                    logger.warning(f"【123】[分片{slice_no}] HTTP {resp.status_code} | 耗时:{cost:.1f}s | 响应: {resp.text[:50]}")
+                    raise Exception(f"HTTP {resp.status_code}")
                     
+                # logger.debug(f"【123】[分片{slice_no}] 上传成功 | 耗时:{cost:.1f}s")
                 return len(chunk)
 
             except Exception as upload_err:
@@ -283,7 +321,11 @@ class P123Api:
                     time.sleep(wait_time)
                     try:
                         # 【修复3】重试时也调用 upload_auth
-                        current_upload_url_resp = self.client.upload_auth(current_upload_data)
+                        current_upload_url_resp = self._call_api_with_log(
+                            f"RetryGetUrl-{slice_no}",
+                            self.client.upload_auth, 
+                            current_upload_data
+                        )
                         check_response(current_upload_url_resp)
                     except Exception:
                         pass
@@ -384,7 +426,7 @@ class P123Api:
             new_path = Path(fileitem.path) / name
             parent_id = self._path_to_id(fileitem.path)
             
-            resp = self.client.fs_mkdir(name, parent_id=parent_id)
+            resp = self._call_api_with_log("Mkdir", self.client.fs_mkdir, name, parent_id=parent_id)
             check_response(resp)
             
             data = resp["data"]["Info"]
@@ -476,7 +518,7 @@ class P123Api:
         """
         try:
             logger.info(f"【123】正在删除: {fileitem.path}")
-            resp = self.client.fs_trash(int(fileitem.fileid), event="intoRecycle")
+            resp = self._call_api_with_log("Trash", self.client.fs_trash, int(fileitem.fileid), event="intoRecycle")
             check_response(resp)
             # 主动清理缓存
             if fileitem.path in self._id_cache:
@@ -497,7 +539,7 @@ class P123Api:
                 "fileName": name,
                 "duplicate": 2,
             }
-            resp = self.client.fs_rename(payload)
+            resp = self._call_api_with_log("Rename", self.client.fs_rename, payload)
             check_response(resp)
             # 清理旧缓存
             if fileitem.path in self._id_cache:
@@ -525,7 +567,7 @@ class P123Api:
                 "S3KeyFlag": s3keyflag,
                 "Size": int(size),
             }
-            resp = self.client.download_info(payload)
+            resp = self._call_api_with_log("GetDownloadUrl", self.client.download_info, payload)
             check_response(resp)
             download_url = resp["data"]["DownloadUrl"]
             local_path = path or settings.TEMP_PATH / fileitem.name
@@ -623,8 +665,10 @@ class P123Api:
         target_name = new_name or local_path.name
         target_path = Path(target_dir.path) / target_name
         file_size = local_path.stat().st_size
-
-        logger.info(f"【123】开始处理文件: {target_name} ({StringUtils.str_filesize(file_size)})")
+        
+        # [优化日志] 生成短 Trace ID
+        task_id = hex(id(target_name))[-6:]
+        logger.info(f"【123】[Task:{task_id}] 开始处理文件: {target_name} ({StringUtils.str_filesize(file_size)})")
 
         # 1. 计算MD5 (带进度显示，IO Buffer优化至 64MB)
         file_md5 = ""
@@ -642,12 +686,13 @@ class P123Api:
                     # 超过100MB文件显示计算进度
                     if time.time() - last_log_time > 5 and file_size > 1024*1024*100:
                         pct = int(processed_size / file_size * 100)
-                        logger.info(f"【123】计算特征值: {pct}%")
+                        logger.info(f"【123】[Task:{task_id}] 计算特征值: {pct}%")
                         last_log_time = time.time()
                         
                 file_md5 = hash_md5.hexdigest()
+            logger.info(f"【123】[Task:{task_id}] MD5计算完毕: {file_md5} | 耗时: {time.time()-start_time:.1f}s")
         except Exception as e:
-            logger.error(f"【123】文件读取/MD5失败: {e}")
+            logger.error(f"【123】[Task:{task_id}] 文件读取/MD5失败: {e}")
             logger.debug(traceback.format_exc()) # 打印堆栈
             return None
 
@@ -672,14 +717,15 @@ class P123Api:
                 "duplicate": 2,
             }
             
-            logger.debug(f"【123】预检查Payload: {json.dumps(upload_req_payload, ensure_ascii=False)}")
+            # logger.debug(f"【123】预检查Payload: {json.dumps(upload_req_payload, ensure_ascii=False)}")
             
-            resp = self.client.upload_request(upload_req_payload)
+            # 使用日志切面
+            resp = self._call_api_with_log(f"UploadReq-{task_id}", self.client.upload_request, upload_req_payload)
             check_response(resp)
             
             # === 场景1：秒传成功 ===
             if resp.get("data").get("Reuse"):
-                logger.info(f"【123】秒传成功: {target_name}")
+                logger.info(f"【123】[Task:{task_id}] 秒传成功: {target_name}")
                 data = resp.get("data", {}).get("Info", {})
                 
                 # 防御性检查
@@ -698,7 +744,7 @@ class P123Api:
                 return self._build_file_item(data, target_path)
             
         except Exception as e:
-            logger.error(f"【123】秒传/预检查失败: {e}")
+            logger.error(f"【123】[Task:{task_id}] 秒传/预检查失败: {e}")
             return None
 
         # === 场景2：普通上传 ===
@@ -716,7 +762,7 @@ class P123Api:
                 current_workers = self._get_dynamic_workers(file_size)
 
                 logger.info(
-                    f"【123】启动并发上传 | 线程: {current_workers} (上限{self.max_upload_threads}) | 分片: {StringUtils.str_filesize(slice_size)} | 总片数: {int(file_size/slice_size)+1}"
+                    f"【123】[Task:{task_id}] 启动并发上传 | 线程: {current_workers} | 分片: {StringUtils.str_filesize(slice_size)} | 总片数: {int(file_size/slice_size)+1}"
                 )
                 
                 progress_callback = transfer_process(local_path.as_posix())
@@ -778,13 +824,13 @@ class P123Api:
                                 current_time = time.time()
                                 if current_time - last_log_time > 15:
                                     percent = int((downloaded_size / file_size) * 100)
-                                    logger.info(f"【123】上传进度: {percent}% ({StringUtils.str_filesize(downloaded_size)}/{StringUtils.str_filesize(file_size)})")
+                                    logger.info(f"【123】[Task:{task_id}] 上传进度: {percent}% ({StringUtils.str_filesize(downloaded_size)}/{StringUtils.str_filesize(file_size)})")
                                     last_log_time = current_time
 
                                 if file_size:
                                     progress_callback((downloaded_size * 100) / file_size)
                             except Exception as e:
-                                logger.error(f"【123】分片线程异常: {e}")
+                                logger.error(f"【123】[Task:{task_id}] 分片线程异常: {e}")
                                 raise e
                 finally:
                     # 清理资源
@@ -795,9 +841,9 @@ class P123Api:
 
                 progress_callback(100)
             else:
-                logger.info(f"【123】小文件直传: {target_name}")
+                logger.info(f"【123】[Task:{task_id}] 小文件直传: {target_name}")
                 # 【修复3】小文件上传前也需要 auth (原代码也是 upload_auth，保持)
-                resp = self.client.upload_auth(upload_data)
+                resp = self._call_api_with_log(f"SmallFileAuth-{task_id}", self.client.upload_auth, upload_data)
                 check_response(resp)
                 
                 with open(local_path, "rb") as f:
@@ -820,14 +866,14 @@ class P123Api:
 
             # 完成确认
             upload_data["isMultipart"] = file_size > slice_size
-            complete_resp = self.client.upload_complete(upload_data)
+            complete_resp = self._call_api_with_log(f"Complete-{task_id}", self.client.upload_complete, upload_data)
             check_response(complete_resp)
 
             # 防御性检查与大文件兼容处理
             resp_data = complete_resp.get("data", {})
             # 兼容逻辑：如果 data 为空但 code 为 0，视为成功
             if (not resp_data or "file_info" not in resp_data) and complete_resp.get("code") == 0:
-                logger.warning(f"【123】上传API返回成功但无元数据(可能是大文件合并中)，手动构造成功响应: {target_name}")
+                logger.warning(f"【123】[Task:{task_id}] 上传API返回成功但无元数据(可能是大文件合并中)，手动构造成功响应: {target_name}")
                 # 手动构造返回数据，确保流程不中断
                 data = {
                     "FileId": "", # 此时拿不到ID，但文件已入库，后续刮削会自动修正
@@ -840,7 +886,7 @@ class P123Api:
                 data = resp_data.get("file_info", {})
 
             if not data or "FileName" not in data:
-                logger.error(f"【123】上传完成但数据异常: {json.dumps(complete_resp, ensure_ascii=False)}")
+                logger.error(f"【123】[Task:{task_id}] 上传完成但数据异常: {json.dumps(complete_resp, ensure_ascii=False)}")
                 return None
 
             end_time = time.time()
@@ -850,7 +896,7 @@ class P123Api:
                 speed_mb = (file_size / 1024 / 1024) / duration
                 speed_str = f"{speed_mb:.2f} MB/s"
 
-            logger.info(f"【123】上传完毕: {target_name} | 耗时: {duration:.1f}s | 均速: {speed_str}")
+            logger.info(f"【123】[Task:{task_id}] 上传完毕: {target_name} | 耗时: {duration:.1f}s | 均速: {speed_str}")
 
             self._send_upload_webhook(
                 file_name=data["FileName"],
@@ -873,9 +919,7 @@ class P123Api:
 
     def copy(self, fileitem: schemas.FileItem, path: Path, new_name: str) -> bool:
         try:
-            resp = self.client.fs_copy(
-                fileitem.fileid, parent_id=self._path_to_id(str(path))
-            )
+            resp = self._call_api_with_log("Copy", self.client.fs_copy, fileitem.fileid, parent_id=self._path_to_id(str(path)))
             check_response(resp)
             logger.info(f"【123】复制成功: {fileitem.name} -> {path}")
             new_path = Path(path) / fileitem.name
@@ -892,9 +936,7 @@ class P123Api:
 
     def move(self, fileitem: schemas.FileItem, path: Path, new_name: str) -> bool:
         try:
-            resp = self.client.fs_move(
-                fileitem.fileid, parent_id=self._path_to_id(str(path))
-            )
+            resp = self._call_api_with_log("Move", self.client.fs_move, fileitem.fileid, parent_id=self._path_to_id(str(path)))
             check_response(resp)
             logger.info(f"【123】移动成功: {fileitem.name} -> {path}")
             new_path = Path(path) / fileitem.name
