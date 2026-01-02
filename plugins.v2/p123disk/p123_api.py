@@ -27,9 +27,9 @@ from app.utils.string import StringUtils
 
 class P123Api:
     """
-    123云盘基础操作 (最终完整优化版 v1.4.2)
+    123云盘基础操作 (最终完整优化版 v1.5.0)
     集成特性：多线程、全局连接池、mmap(带自动降级)、异步Webhook池、指数重试、自动分片、大文件兼容
-    优化更新：TTL缓存(1小时)、动态线程策略(3/5/8)、Mmap失败自动回退、增强日志与超时重试
+    优化更新：取消动态线程限制(设置多少即多少)、移除32线程锁、连接池自适应
     """
 
     # 【优化1：缓存策略】使用 TTLCache，最大10000条，有效期3600秒(1小时)
@@ -50,19 +50,21 @@ class P123Api:
         self.webhook_url = webhook_url
         self.webhook_secret = webhook_secret
         
-        # 处理并发线程数 (这是用户设置的"上限")
+        # 【优化修改】：取消动态策略，严格遵循用户设置
         try:
-            self.max_upload_threads = int(upload_threads) if upload_threads else 3
-            if self.max_upload_threads < 1: self.max_upload_threads = 1
-            if self.max_upload_threads > 32: self.max_upload_threads = 32
+            # 默认值设为 8
+            self.max_upload_threads = int(upload_threads) if upload_threads else 8
+            if self.max_upload_threads < 1: 
+                self.max_upload_threads = 1
+            # 删除了 >32 的强制限制，允许用户根据机器性能自由设置
         except Exception:
-            self.max_upload_threads = 3
+            self.max_upload_threads = 8
 
         # 初始化全局 HTTP Session (连接复用)
         self._session = requests.Session()
         
-        # 【优化】：连接池大小按照最大可能的线程数来设置，防止高并发时阻塞
-        pool_size = max(self.max_upload_threads, 16)
+        # 【优化】：连接池大小按照设定线程数来设置，并预留余量
+        pool_size = max(self.max_upload_threads, 32)
         
         adapter = HTTPAdapter(
             pool_connections=pool_size, 
@@ -72,7 +74,7 @@ class P123Api:
         self._session.mount('https://', adapter)
         self._session.mount('http://', adapter)
         
-        logger.debug(f"【123】API实例初始化 | 线程上限: {self.max_upload_threads} | 连接池: {pool_size} | Webhook: {'开启' if webhook_url else '关闭'}")
+        logger.debug(f"【123】API实例初始化 | 固定并发: {self.max_upload_threads} | 连接池: {pool_size} | Webhook: {'开启' if webhook_url else '关闭'}")
 
     def __del__(self):
         """清理资源"""
@@ -132,7 +134,7 @@ class P123Api:
                     else:
                         time.sleep(1)
                     
-                    # 【新增优化】目录列表请求增加重试机制 (针对 ReadTimeout)
+                    # 目录列表请求增加重试机制 (针对 ReadTimeout)
                     retry_list = 0
                     max_list_retries = 3
                     resp = None
@@ -173,7 +175,7 @@ class P123Api:
                         _next = resp.get("data").get("Next")
                         
                 if not find_part:
-                    # 【优化1：缓存驱逐】路径不存在，清除可能的错误缓存
+                    # 路径不存在，清除可能的错误缓存
                     if path in self._id_cache:
                         del self._id_cache[path]
                         logger.debug(f"【123】路径不存在，清除缓存: {path}")
@@ -192,33 +194,13 @@ class P123Api:
                 del self._id_cache[path]
             raise e
 
-    def _get_dynamic_workers(self, file_size: int) -> int:
-        """
-        【优化3：动态并发控制】
-        根据文件大小动态计算并发线程数
-        """
-        gb = 1024 * 1024 * 1024
-        
-        if file_size < 5 * gb:
-            workers = 3
-        elif file_size < 10 * gb:
-            workers = 5
-        else:
-            workers = 8
-            
-        # 始终受限于用户设置的全局最大值 (防止低配机器崩溃)
-        final_workers = min(workers, self.max_upload_threads)
-        
-        # 兜底至少 1 个线程
-        return max(1, final_workers)
-
     def _upload_chunk_worker(self, session, data_source, slice_no, offset, size, upload_data, target_name, file_lock=None):
         """
         分片上传的工作线程函数
         """
         chunk = None
         try:
-            # 【优化2：Mmap 兼容读取】
+            # Mmap 兼容读取
             if isinstance(data_source, mmap.mmap):
                 chunk = data_source[offset : offset + size]
             else:
@@ -272,7 +254,7 @@ class P123Api:
                 retry_count += 1
                 if retry_count < max_retries:
                     wait_time = 2 ** (retry_count - 1)
-                    # 【日志优化】记录详细重试原因
+                    # 记录详细重试原因
                     logger.warning(f"【123】{target_name} 分片{slice_no} 上传失败(第{retry_count}次): {upload_err} -> 等待{wait_time}s")
                     time.sleep(wait_time)
                     try:
@@ -319,7 +301,7 @@ class P123Api:
                 else:
                     time.sleep(1)
                 
-                # 【新增优化】浏览目录也增加网络超时保护
+                # 浏览目录也增加网络超时保护
                 try:
                     resp = self.client.fs_list(payload)
                     check_response(resp)
@@ -605,7 +587,7 @@ class P123Api:
         new_name: Optional[str] = None,
     ) -> Optional[schemas.FileItem]:
         """
-        上传文件 (全功能：秒传检测+断点续传+详细日志+异常修复+动态线程+Mmap回退)
+        上传文件 (全功能：秒传检测+断点续传+详细日志+异常修复+固定并发+Mmap回退)
         """
         start_time = time.time()
         target_name = new_name or local_path.name
@@ -636,7 +618,7 @@ class P123Api:
                 file_md5 = hash_md5.hexdigest()
         except Exception as e:
             logger.error(f"【123】文件读取/MD5失败: {e}")
-            logger.debug(traceback.format_exc()) # 【日志优化】打印堆栈
+            logger.debug(traceback.format_exc()) # 打印堆栈
             return None
 
         try:
@@ -700,11 +682,11 @@ class P123Api:
             slice_size = int(upload_data.get("SliceSize", 10*1024*1024))
             
             if file_size > slice_size:
-                # 【优化3：动态线程计算】
-                current_workers = self._get_dynamic_workers(file_size)
+                # 【优化修改】：直接使用用户配置的固定线程数
+                current_workers = self.max_upload_threads
 
                 logger.info(
-                    f"【123】启动并发上传 | 线程: {current_workers} (上限{self.max_upload_threads}) | 分片: {StringUtils.str_filesize(slice_size)} | 总片数: {int(file_size/slice_size)+1}"
+                    f"【123】启动并发上传 | 模式: 固定并发 | 线程数: {current_workers} | 分片: {StringUtils.str_filesize(slice_size)} | 总片数: {int(file_size/slice_size)+1}"
                 )
                 
                 progress_callback = transfer_process(local_path.as_posix())
@@ -721,7 +703,7 @@ class P123Api:
                 downloaded_size = 0
                 last_log_time = 0 
                 
-                # 【优化2：Mmap 兼容性回退逻辑】
+                # Mmap 兼容性回退逻辑
                 use_mmap = True
                 f = open(local_path, "rb")
                 mmapped_file = None
@@ -810,12 +792,11 @@ class P123Api:
             complete_resp = self.client.upload_complete(upload_data)
             check_response(complete_resp)
 
-            # 防御性检查与大文件兼容处理 (核心修复)
+            # 防御性检查与大文件兼容处理
             resp_data = complete_resp.get("data", {})
             # 兼容逻辑：如果 data 为空但 code 为 0，视为成功
             if (not resp_data or "file_info" not in resp_data) and complete_resp.get("code") == 0:
                 logger.warning(f"【123】上传API返回成功但无元数据(可能是大文件合并中)，手动构造成功响应: {target_name}")
-                # 手动构造返回数据，确保流程不中断
                 data = {
                     "FileId": "", # 此时拿不到ID，但文件已入库，后续刮削会自动修正
                     "FileName": target_name,
@@ -852,9 +833,8 @@ class P123Api:
 
         except Exception as e:
             logger.error(f"【123】上传流程崩溃: {e}")
-            logger.debug(traceback.format_exc()) # 【日志优化】打印堆栈
+            logger.debug(traceback.format_exc()) # 打印堆栈
             return None
-        # 全局 Session 不在此关闭，由 __del__ 或垃圾回收处理
 
     def detail(self, fileitem: schemas.FileItem) -> Optional[schemas.FileItem]:
         return self.get_item(Path(fileitem.path))

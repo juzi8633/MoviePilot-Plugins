@@ -73,7 +73,7 @@ class P123Disk(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/juzi8633/MoviePilot-Plugins/main/icons/P123Disk.png"
     # 插件版本
-    plugin_version = "1.4.7"
+    plugin_version = "1.4.9"
     # 插件作者
     plugin_author = "juzi8633"
     # 作者主页
@@ -98,7 +98,7 @@ class P123Disk(_PluginBase):
     _webhook_secret = None
     _upload_threads = 8 # 默认值提高以适应新策略
 
-    # 【新增优化】定义需要忽略的临时文件后缀列表
+    # 定义需要忽略的临时文件后缀列表
     # 包括: qBittorrent, Transmission, Aria2, IDM, Chrome/Edge CRDOWNLOAD, 通用临时文件
     _IGNORED_SUFFIXES = (
         '.!qB',       # qBittorrent
@@ -268,8 +268,9 @@ class P123Disk(_PluginBase):
                                         "component": "VTextField",
                                         "props": {
                                             "model": "upload_threads",
-                                            "label": "最大并发线程上限",
-                                            "placeholder": "建议设置8-16。程序将根据文件大小自动调节(小文件3/大文件8)",
+                                            "label": "固定上传并发数",
+                                            # 更新了文案以匹配新逻辑
+                                            "placeholder": "设置为多少即为多少(如8-32)。秒传文件不消耗线程，仅实体上传生效。",
                                         },
                                     }
                                 ],
@@ -284,7 +285,7 @@ class P123Disk(_PluginBase):
             "password": "",
             "webhook_url": "",
             "webhook_secret": "",
-            "upload_threads": "8", # 默认值修改为 8
+            "upload_threads": "8", # 默认值 8
         }
 
     def get_page(self) -> List[dict]:
@@ -386,7 +387,7 @@ class P123Disk(_PluginBase):
         if fileitem.storage != self._disk_name:
             return None
             
-        # 【新增优化】检查是否为下载中的临时文件
+        # 检查是否为下载中的临时文件
         # 获取文件名（如果有 new_name 用 new_name，否则用本地路径的文件名）
         check_name = new_name if new_name else path.name
         
