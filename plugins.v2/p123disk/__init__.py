@@ -3,7 +3,9 @@ from typing import Any, List, Dict, Tuple, Optional
 import threading
 import time
 
+# 确保 requirements.txt 中已安装 p123client
 from p123client import P123Client
+# 引用同目录下的 p123_api.py (我们刚才修复的那个文件)
 from .p123_api import P123Api
 
 from app import schemas
@@ -37,7 +39,13 @@ class P123AutoClient:
             attr = getattr(self._client, name)
             if not callable(attr):
                 return attr
-            result = attr(*args, **kwargs)
+            
+            try:
+                result = attr(*args, **kwargs)
+            except Exception as e:
+                # 某些版本的 SDK 可能直接抛出异常而不是返回 dict，这里做个防御
+                logger.debug(f"【123】API调用异常: {e}")
+                raise e
             
             # 检查是否需要刷新Token
             if (
@@ -73,7 +81,7 @@ class P123Disk(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/juzi8633/MoviePilot-Plugins/main/icons/P123Disk.png"
     # 插件版本
-    plugin_version = "1.4.3"
+    plugin_version = "1.4.5"
     # 插件作者
     plugin_author = "juzi8633"
     # 作者主页

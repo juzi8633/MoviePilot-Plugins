@@ -16,6 +16,7 @@ from requests.adapters import HTTPAdapter
 from requests.exceptions import RequestException, ReadTimeout, ConnectTimeout
 from cachetools import TTLCache 
 
+# 假设 p123client 已经正确安装
 from p123client import P123Client, check_response
 
 from app import schemas
@@ -27,14 +28,14 @@ from app.utils.string import StringUtils
 
 class P123Api:
     """
-    123云盘基础操作 (最终完整优化版 v1.4.2)
+    123云盘基础操作 (最终完整修复版 v1.4.4)
     集成特性：多线程、全局连接池、mmap(带自动降级)、异步Webhook池、指数重试、自动分片、大文件兼容
-    优化更新：TTL缓存(1小时)、动态线程策略(3/5/8)、Mmap失败自动回退、增强日志与超时重试
+    修复记录：
+    1. _id_cache 改为实例属性，解决多账号缓存冲突
+    2. Webhook 日志移除 secret 明文
+    3. 分片上传修正为调用 upload_auth 并补充 partNumber
     """
 
-    # 【优化1：缓存策略】使用 TTLCache，最大10000条，有效期3600秒(1小时)
-    _id_cache = TTLCache(maxsize=10000, ttl=3600)
-    
     # Webhook 发送线程池 (限制并发，防止资源耗尽)
     _webhook_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="P123Webhook")
 
@@ -45,6 +46,9 @@ class P123Api:
         """
         初始化
         """
+        # 【修复1：缓存策略】移入 __init__，确保多实例隔离
+        self._id_cache = TTLCache(maxsize=10000, ttl=3600)
+
         self.client = client
         self._disk_name = disk_name
         self.webhook_url = webhook_url
@@ -61,7 +65,7 @@ class P123Api:
         # 初始化全局 HTTP Session (连接复用)
         self._session = requests.Session()
         
-        # 【优化】：连接池大小按照最大可能的线程数来设置，防止高并发时阻塞
+        # 连接池大小按照最大可能的线程数来设置，防止高并发时阻塞
         pool_size = max(self.max_upload_threads, 16)
         
         adapter = HTTPAdapter(
@@ -132,7 +136,7 @@ class P123Api:
                     else:
                         time.sleep(1)
                     
-                    # 【新增优化】目录列表请求增加重试机制 (针对 ReadTimeout)
+                    # 目录列表请求增加重试机制 (针对 ReadTimeout)
                     retry_list = 0
                     max_list_retries = 3
                     resp = None
@@ -173,7 +177,7 @@ class P123Api:
                         _next = resp.get("data").get("Next")
                         
                 if not find_part:
-                    # 【优化1：缓存驱逐】路径不存在，清除可能的错误缓存
+                    # 路径不存在，清除可能的错误缓存
                     if path in self._id_cache:
                         del self._id_cache[path]
                         logger.debug(f"【123】路径不存在，清除缓存: {path}")
@@ -194,7 +198,6 @@ class P123Api:
 
     def _get_dynamic_workers(self, file_size: int) -> int:
         """
-        【优化3：动态并发控制】
         根据文件大小动态计算并发线程数
         """
         gb = 1024 * 1024 * 1024
@@ -218,7 +221,7 @@ class P123Api:
         """
         chunk = None
         try:
-            # 【优化2：Mmap 兼容读取】
+            # Mmap 兼容读取
             if isinstance(data_source, mmap.mmap):
                 chunk = data_source[offset : offset + size]
             else:
@@ -239,13 +242,16 @@ class P123Api:
         current_upload_data = copy.deepcopy(upload_data)
         current_upload_data["partNumberStart"] = slice_no
         current_upload_data["partNumberEnd"] = slice_no + 1
+        # 【修复3】补充 SDK 所需的 partNumber 参数
+        current_upload_data["partNumber"] = slice_no
 
         max_retries = 5
         retry_count = 0
         
         # 获取URL (预处理阶段)
         try:
-            current_upload_url_resp = self.client.upload_prepare(current_upload_data)
+            # 【修复3】修正方法名为 upload_auth
+            current_upload_url_resp = self.client.upload_auth(current_upload_data)
             check_response(current_upload_url_resp)
         except Exception as e:
             logger.error(f"【123】获取分片上传URL失败(分片{slice_no}): {e}")
@@ -272,11 +278,12 @@ class P123Api:
                 retry_count += 1
                 if retry_count < max_retries:
                     wait_time = 2 ** (retry_count - 1)
-                    # 【日志优化】记录详细重试原因
+                    # 记录详细重试原因
                     logger.warning(f"【123】{target_name} 分片{slice_no} 上传失败(第{retry_count}次): {upload_err} -> 等待{wait_time}s")
                     time.sleep(wait_time)
                     try:
-                        current_upload_url_resp = self.client.upload_prepare(current_upload_data)
+                        # 【修复3】重试时也调用 upload_auth
+                        current_upload_url_resp = self.client.upload_auth(current_upload_data)
                         check_response(current_upload_url_resp)
                     except Exception:
                         pass
@@ -319,7 +326,7 @@ class P123Api:
                 else:
                     time.sleep(1)
                 
-                # 【新增优化】浏览目录也增加网络超时保护
+                # 浏览目录也增加网络超时保护
                 try:
                     resp = self.client.fs_list(payload)
                     check_response(resp)
@@ -576,7 +583,12 @@ class P123Api:
                 "timestamp": int(time.time())
             }
             
-            logger.debug(f"【123】WebHook请求Payload: {json.dumps(payload, ensure_ascii=False)}")
+            # 【修复2】日志安全脱敏：防止 Secret 明文泄露
+            log_payload = copy.deepcopy(payload)
+            if "secret" in log_payload:
+                log_payload["secret"] = "******"
+            
+            logger.debug(f"【123】WebHook请求Payload: {json.dumps(log_payload, ensure_ascii=False)}")
             
             resp = self._session.post(self.webhook_url, json=payload, timeout=10)
             logger.info(f"【123】WebHook响应 [{resp.status_code}]: {resp.text[:500]}")
@@ -636,7 +648,7 @@ class P123Api:
                 file_md5 = hash_md5.hexdigest()
         except Exception as e:
             logger.error(f"【123】文件读取/MD5失败: {e}")
-            logger.debug(traceback.format_exc()) # 【日志优化】打印堆栈
+            logger.debug(traceback.format_exc()) # 打印堆栈
             return None
 
         try:
@@ -700,7 +712,7 @@ class P123Api:
             slice_size = int(upload_data.get("SliceSize", 10*1024*1024))
             
             if file_size > slice_size:
-                # 【优化3：动态线程计算】
+                # 动态线程计算
                 current_workers = self._get_dynamic_workers(file_size)
 
                 logger.info(
@@ -721,7 +733,7 @@ class P123Api:
                 downloaded_size = 0
                 last_log_time = 0 
                 
-                # 【优化2：Mmap 兼容性回退逻辑】
+                # Mmap 兼容性回退逻辑
                 use_mmap = True
                 f = open(local_path, "rb")
                 mmapped_file = None
@@ -784,6 +796,7 @@ class P123Api:
                 progress_callback(100)
             else:
                 logger.info(f"【123】小文件直传: {target_name}")
+                # 【修复3】小文件上传前也需要 auth (原代码也是 upload_auth，保持)
                 resp = self.client.upload_auth(upload_data)
                 check_response(resp)
                 
@@ -810,7 +823,7 @@ class P123Api:
             complete_resp = self.client.upload_complete(upload_data)
             check_response(complete_resp)
 
-            # 防御性检查与大文件兼容处理 (核心修复)
+            # 防御性检查与大文件兼容处理
             resp_data = complete_resp.get("data", {})
             # 兼容逻辑：如果 data 为空但 code 为 0，视为成功
             if (not resp_data or "file_info" not in resp_data) and complete_resp.get("code") == 0:
@@ -852,9 +865,8 @@ class P123Api:
 
         except Exception as e:
             logger.error(f"【123】上传流程崩溃: {e}")
-            logger.debug(traceback.format_exc()) # 【日志优化】打印堆栈
+            logger.debug(traceback.format_exc())
             return None
-        # 全局 Session 不在此关闭，由 __del__ 或垃圾回收处理
 
     def detail(self, fileitem: schemas.FileItem) -> Optional[schemas.FileItem]:
         return self.get_item(Path(fileitem.path))
@@ -869,7 +881,8 @@ class P123Api:
             new_path = Path(path) / fileitem.name
             new_item = self.get_item(new_path)
             self.rename(new_item, new_name)
-            del self._id_cache[fileitem.path]
+            if fileitem.path in self._id_cache:
+                del self._id_cache[fileitem.path]
             rename_new_path = Path(path) / new_name
             self._id_cache[str(rename_new_path)] = new_item.fileid
             return True
@@ -887,7 +900,8 @@ class P123Api:
             new_path = Path(path) / fileitem.name
             new_item = self.get_item(new_path)
             self.rename(new_item, new_name)
-            del self._id_cache[fileitem.path]
+            if fileitem.path in self._id_cache:
+                del self._id_cache[fileitem.path]
             rename_new_path = Path(path) / new_name
             self._id_cache[str(rename_new_path)] = new_item.fileid
             return True
