@@ -27,9 +27,9 @@ from app.utils.string import StringUtils
 
 class P123Api:
     """
-    123云盘基础操作 (最终完整优化版 v1.5.0)
+    123云盘基础操作 (最终完整优化版 v1.5.1)
     集成特性：多线程、全局连接池、mmap(带自动降级)、异步Webhook池、指数重试、自动分片、大文件兼容
-    优化更新：取消动态线程限制(设置多少即多少)、移除32线程锁、连接池自适应
+    优化更新：增强错误日志透传、修复Token并发刷新逻辑
     """
 
     # 【优化1：缓存策略】使用 TTLCache，最大10000条，有效期3600秒(1小时)
@@ -246,7 +246,14 @@ class P123Api:
                 )
                 
                 if resp.status_code != 200:
-                    raise Exception(f"HTTP {resp.status_code} - {resp.text[:50]}")
+                    # 【优化】: 尝试提取详细错误信息，避免只显示状态码
+                    try:
+                        err_msg = json.dumps(resp.json(), ensure_ascii=False)
+                    except Exception:
+                        err_msg = resp.text[:500]  # 扩大截取范围到500字符
+                    
+                    logger.warning(f"【123】分片{slice_no}上传返回异常: HTTP {resp.status_code} | Msg: {err_msg}")
+                    raise Exception(f"HTTP {resp.status_code} - {err_msg}")
                     
                 return len(chunk)
 
@@ -645,6 +652,11 @@ class P123Api:
             logger.debug(f"【123】预检查Payload: {json.dumps(upload_req_payload, ensure_ascii=False)}")
             
             resp = self.client.upload_request(upload_req_payload)
+            
+            # 【优化】: 预检查失败时记录详细响应，便于Debug (比如文件名违规或空间不足)
+            if resp.get("code") != 0:
+                logger.error(f"【123】上传预检查失败 | 文件: {target_name} | 错误信息: {json.dumps(resp, ensure_ascii=False)}")
+
             check_response(resp)
             
             # === 场景1：秒传成功 ===
@@ -668,7 +680,14 @@ class P123Api:
                 return self._build_file_item(data, target_path)
             
         except Exception as e:
-            logger.error(f"【123】秒传/预检查失败: {e}")
+            # 捕获异常并尝试透传服务端 Response 信息
+            err_details = str(e)
+            if hasattr(e, "response") and e.response:
+                try:
+                    err_details += f" | Response: {e.response.text}"
+                except:
+                    pass
+            logger.error(f"【123】秒传/预检查失败: {err_details}")
             return None
 
         # === 场景2：普通上传 ===
@@ -781,7 +800,8 @@ class P123Api:
                             timeout=300
                         )
                         if resp_put.status_code != 200:
-                            raise Exception(f"HTTP {resp_put.status_code}")
+                            # 增加小文件上传的错误日志
+                            raise Exception(f"HTTP {resp_put.status_code} - {resp_put.text[:500]}")
                         break
                     except Exception as e:
                         if i == 2: raise Exception(f"小文件上传超时: {e}")
@@ -832,7 +852,15 @@ class P123Api:
             return self._build_file_item(data, target_path)
 
         except Exception as e:
-            logger.error(f"【123】上传流程崩溃: {e}")
+            # 捕获异常并尝试透传服务端 Response 信息
+            detailed_error = str(e)
+            if hasattr(e, 'response') and e.response is not None:
+                try:
+                    detailed_error += f" | Server Response: {e.response.text}"
+                except:
+                    pass
+            
+            logger.error(f"【123】上传流程崩溃: {detailed_error}")
             logger.debug(traceback.format_exc()) # 打印堆栈
             return None
 

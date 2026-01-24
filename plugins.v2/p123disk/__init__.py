@@ -34,10 +34,12 @@ class P123AutoClient:
                     self._client = P123Client(self._passport, self._password)  # noqa
 
         def wrapped(*args, **kwargs):
-            attr = getattr(self._client, name)
-            if not callable(attr):
-                return attr
-            result = attr(*args, **kwargs)
+            # 获取当前的方法引用
+            current_attr = getattr(self._client, name)
+            if not callable(current_attr):
+                return current_attr
+            
+            result = current_attr(*args, **kwargs)
             
             # 检查是否需要刷新Token
             if (
@@ -45,21 +47,28 @@ class P123AutoClient:
                 and result.get("code") == 401
                 and result.get("message") == "tokens number has exceeded the limit"
             ):
-                # 获取锁，确保只有一个线程执行登录操作
                 with self._lock:
-                    # 再次检查时间戳，防止重复刷新
+                    # 再次检查时间戳，防止其他线程已经刷新过
                     if time.time() - self._last_reset_time < 10:
-                        logger.debug("【123】Token刷新锁定中，直接使用新实例重试")
+                        logger.debug("【123】检测到Token刚刷新，跳过重置，使用新实例重试")
                     else:
-                        logger.info("【123】Token失效，执行重新登录...")
-                        self._client = P123Client(self._passport, self._password)  # noqa
-                        self._last_reset_time = time.time()
+                        logger.warning(f"【123】Token失效(401)，正在执行重新登录... (操作: {name})")
+                        try:
+                            self._client = P123Client(self._passport, self._password)  # noqa
+                            self._last_reset_time = time.time()
+                        except Exception as login_err:
+                            logger.error(f"【123】自动重登失败: {login_err}")
+                            return result # 登录失败则返回原始错误
                 
-                # 获取新实例的方法
-                attr = getattr(self._client, name)
-                if not callable(attr):
-                    return attr
-                return attr(*args, **kwargs)
+                # 【关键修复】: 无论是否由当前线程执行了刷新，都必须从 self._client 获取最新的方法引用
+                # 因为 self._client 已经被(本线程或其他线程)更新了，旧的 current_attr 绑定的是旧 client 实例
+                new_attr = getattr(self._client, name)
+                if not callable(new_attr):
+                    return new_attr
+                
+                logger.info(f"【123】使用新Token重试操作: {name}")
+                return new_attr(*args, **kwargs)
+                
             return result
 
         return wrapped
@@ -73,7 +82,7 @@ class P123Disk(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/juzi8633/MoviePilot-Plugins/main/icons/P123Disk.png"
     # 插件版本
-    plugin_version = "1.4.9"
+    plugin_version = "1.5.0"
     # 插件作者
     plugin_author = "juzi8633"
     # 作者主页
