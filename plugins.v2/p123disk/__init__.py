@@ -61,7 +61,6 @@ class P123AutoClient:
                             return result # 登录失败则返回原始错误
                 
                 # 【关键修复】: 无论是否由当前线程执行了刷新，都必须从 self._client 获取最新的方法引用
-                # 因为 self._client 已经被(本线程或其他线程)更新了，旧的 current_attr 绑定的是旧 client 实例
                 new_attr = getattr(self._client, name)
                 if not callable(new_attr):
                     return new_attr
@@ -82,7 +81,7 @@ class P123Disk(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/juzi8633/MoviePilot-Plugins/main/icons/P123Disk.png"
     # 插件版本
-    plugin_version = "1.5.0"
+    plugin_version = "1.6.0"
     # 插件作者
     plugin_author = "juzi8633"
     # 作者主页
@@ -105,10 +104,9 @@ class P123Disk(_PluginBase):
     # 新增配置项
     _webhook_url = None
     _webhook_secret = None
-    _upload_threads = 8 # 默认值提高以适应新策略
+    _upload_threads = 8 
 
     # 定义需要忽略的临时文件后缀列表
-    # 包括: qBittorrent, Transmission, Aria2, IDM, Chrome/Edge CRDOWNLOAD, 通用临时文件
     _IGNORED_SUFFIXES = (
         '.!qB',       # qBittorrent
         '.part',      # Transmission / General
@@ -278,7 +276,6 @@ class P123Disk(_PluginBase):
                                         "props": {
                                             "model": "upload_threads",
                                             "label": "固定上传并发数",
-                                            # 更新了文案以匹配新逻辑
                                             "placeholder": "设置为多少即为多少(如8-32)。秒传文件不消耗线程，仅实体上传生效。",
                                         },
                                     }
@@ -391,26 +388,27 @@ class P123Disk(_PluginBase):
         self, fileitem: schemas.FileItem, path: Path, new_name: Optional[str] = None
     ) -> Optional[schemas.FileItem]:
         """
-        上传文件 (增加临时文件过滤)
+        上传文件 (修正版：强制检查源文件后缀)
         """
         if fileitem.storage != self._disk_name:
             return None
             
-        # 检查是否为下载中的临时文件
-        # 获取文件名（如果有 new_name 用 new_name，否则用本地路径的文件名）
-        check_name = new_name if new_name else path.name
+        # 1. 强制检查【本地源文件】的后缀
+        src_lower_name = path.name.lower()
         
-        # 统一转为小写进行比对，防止大小写差异
-        lower_name = check_name.lower()
+        # 2. 检查 new_name (如果有)
+        dest_lower_name = new_name.lower() if new_name else ""
         
-        if any(lower_name.endswith(suffix.lower()) for suffix in self._IGNORED_SUFFIXES):
-            logger.info(f"【123】跳过下载中/临时文件: {check_name}")
-            # 返回 None 表示未执行上传，MoviePilot 会认为处理完成或跳过
-            return None
+        # 遍历黑名单
+        for suffix in self._IGNORED_SUFFIXES:
+            s_low = suffix.lower()
+            if src_lower_name.endswith(s_low) or (dest_lower_name and dest_lower_name.endswith(s_low)):
+                logger.info(f"【123】检测到临时文件，已拦截上传: {path.name} (后缀命中: {suffix})")
+                return None
             
-        # 额外的防御：忽略以 . 开头的隐藏文件 (如 .DS_Store)
-        if check_name.startswith('.'):
-             logger.debug(f"【123】跳过隐藏文件: {check_name}")
+        # 3. 隐藏文件过滤
+        if path.name.startswith('.'):
+             logger.debug(f"【123】跳过隐藏文件: {path.name}")
              return None
 
         return self._p123_api.upload(fileitem, path, new_name)

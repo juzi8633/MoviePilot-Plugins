@@ -27,9 +27,9 @@ from app.utils.string import StringUtils
 
 class P123Api:
     """
-    123云盘基础操作 (最终完整优化版 v1.5.1)
-    集成特性：多线程、全局连接池、mmap(带自动降级)、异步Webhook池、指数重试、自动分片、大文件兼容
-    优化更新：增强错误日志透传、修复Token并发刷新逻辑
+    123云盘基础操作 (最终完整优化版 v1.6.2)
+    集成特性：全局文件并发控制(Max=2)、同文件去重、多线程分片、全局连接池、mmap、错误透传
+    更新说明：增加关键API响应内容的详细日志打印，方便排查接口问题
     """
 
     # 【优化1：缓存策略】使用 TTLCache，最大10000条，有效期3600秒(1小时)
@@ -37,6 +37,15 @@ class P123Api:
     
     # Webhook 发送线程池 (限制并发，防止资源耗尽)
     _webhook_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="P123Webhook")
+
+    # 【新增特性：全局文件并发控制】
+    # 限制同时只有 2 个文件进行 MD5计算 或 上传，防止磁盘IO爆炸
+    _file_semaphore = threading.Semaphore(2)
+    
+    # 【新增特性：同文件防并发锁】
+    # 记录正在上传的绝对路径，防止 MoviePilot 重复触发同一个文件的上传
+    _uploading_files = set()
+    _uploading_files_lock = threading.Lock()
 
     def __init__(self, client: P123Client, disk_name: str, 
                  webhook_url: str = None, 
@@ -50,20 +59,18 @@ class P123Api:
         self.webhook_url = webhook_url
         self.webhook_secret = webhook_secret
         
-        # 【优化修改】：取消动态策略，严格遵循用户设置
         try:
             # 默认值设为 8
             self.max_upload_threads = int(upload_threads) if upload_threads else 8
             if self.max_upload_threads < 1: 
                 self.max_upload_threads = 1
-            # 删除了 >32 的强制限制，允许用户根据机器性能自由设置
         except Exception:
             self.max_upload_threads = 8
 
         # 初始化全局 HTTP Session (连接复用)
         self._session = requests.Session()
         
-        # 【优化】：连接池大小按照设定线程数来设置，并预留余量
+        # 连接池大小按照设定线程数来设置，并预留余量
         pool_size = max(self.max_upload_threads, 32)
         
         adapter = HTTPAdapter(
@@ -74,7 +81,7 @@ class P123Api:
         self._session.mount('https://', adapter)
         self._session.mount('http://', adapter)
         
-        logger.debug(f"【123】API实例初始化 | 固定并发: {self.max_upload_threads} | 连接池: {pool_size} | Webhook: {'开启' if webhook_url else '关闭'}")
+        logger.debug(f"【123】API实例初始化 | 文件并发限制: 2 | 分片线程: {self.max_upload_threads} | 连接池: {pool_size}")
 
     def __del__(self):
         """清理资源"""
@@ -178,7 +185,6 @@ class P123Api:
                     # 路径不存在，清除可能的错误缓存
                     if path in self._id_cache:
                         del self._id_cache[path]
-                        logger.debug(f"【123】路径不存在，清除缓存: {path}")
                     raise FileNotFoundError(f"【123】路径节点不存在: {part} (in {path})")
             
             if not current_id:
@@ -228,6 +234,8 @@ class P123Api:
         # 获取URL (预处理阶段)
         try:
             current_upload_url_resp = self.client.upload_prepare(current_upload_data)
+            # 【新增日志】Debug级别打印分片获取响应，方便深度排查
+            logger.debug(f"【123】分片预处理响应(Slice:{slice_no}): {json.dumps(current_upload_url_resp, ensure_ascii=False)}")
             check_response(current_upload_url_resp)
         except Exception as e:
             logger.error(f"【123】获取分片上传URL失败(分片{slice_no}): {e}")
@@ -246,13 +254,12 @@ class P123Api:
                 )
                 
                 if resp.status_code != 200:
-                    # 【优化】: 尝试提取详细错误信息，避免只显示状态码
                     try:
                         err_msg = json.dumps(resp.json(), ensure_ascii=False)
                     except Exception:
-                        err_msg = resp.text[:500]  # 扩大截取范围到500字符
+                        err_msg = resp.text[:500]
                     
-                    logger.warning(f"【123】分片{slice_no}上传返回异常: HTTP {resp.status_code} | Msg: {err_msg}")
+                    logger.warning(f"【123】分片{slice_no}上传异常: HTTP {resp.status_code} | {err_msg}")
                     raise Exception(f"HTTP {resp.status_code} - {err_msg}")
                     
                 return len(chunk)
@@ -261,7 +268,7 @@ class P123Api:
                 retry_count += 1
                 if retry_count < max_retries:
                     wait_time = 2 ** (retry_count - 1)
-                    # 记录详细重试原因
+                    # 详细重试日志
                     logger.warning(f"【123】{target_name} 分片{slice_no} 上传失败(第{retry_count}次): {upload_err} -> 等待{wait_time}s")
                     time.sleep(wait_time)
                     try:
@@ -594,13 +601,38 @@ class P123Api:
         new_name: Optional[str] = None,
     ) -> Optional[schemas.FileItem]:
         """
-        上传文件 (全功能：秒传检测+断点续传+详细日志+异常修复+固定并发+Mmap回退)
+        上传文件 (带并发控制和去重)
+        """
+        local_path_str = str(local_path.resolve())
+        target_name = new_name or local_path.name
+        
+        # 1. 检查是否已经在上传队列中 (同文件去重)
+        with self._uploading_files_lock:
+            if local_path_str in self._uploading_files:
+                logger.warning(f"【123】检测到该文件正在上传中，跳过重复任务: {target_name}")
+                return None
+            self._uploading_files.add(local_path_str)
+
+        try:
+            # 2. 获取全局文件并发锁 (最多允许2个文件同时进行)
+            with self._file_semaphore:
+                return self._do_upload_logic(target_dir, local_path, target_name)
+        except Exception as e:
+            logger.error(f"【123】任务调度异常: {e}")
+            return None
+        finally:
+            # 3. 任务结束(无论成功失败)，移除去重标记
+            with self._uploading_files_lock:
+                if local_path_str in self._uploading_files:
+                    self._uploading_files.remove(local_path_str)
+
+    def _do_upload_logic(self, target_dir, local_path, target_name):
+        """
+        实际的上传逻辑（计算MD5 -> 秒传/分片上传）
         """
         start_time = time.time()
-        target_name = new_name or local_path.name
         target_path = Path(target_dir.path) / target_name
         file_size = local_path.stat().st_size
-
         logger.info(f"【123】开始处理文件: {target_name} ({StringUtils.str_filesize(file_size)})")
 
         # 1. 计算MD5 (带进度显示，IO Buffer优化至 64MB)
@@ -639,7 +671,6 @@ class P123Api:
                     logger.error(f"【123】无法获取目标目录ID: {pid_err}")
                     return None
             
-            # 不再设置 sliceSize，遵循服务器策略
             upload_req_payload = {
                 "etag": file_md5,
                 "fileName": target_name,
@@ -653,9 +684,12 @@ class P123Api:
             
             resp = self.client.upload_request(upload_req_payload)
             
-            # 【优化】: 预检查失败时记录详细响应，便于Debug (比如文件名违规或空间不足)
+            # 【优化】: 预检查失败时记录详细响应，便于Debug
             if resp.get("code") != 0:
                 logger.error(f"【123】上传预检查失败 | 文件: {target_name} | 错误信息: {json.dumps(resp, ensure_ascii=False)}")
+            
+            # 【新增日志】: 无论成功失败，打印详细响应以便排查
+            logger.info(f"【123】预检查响应: {json.dumps(resp, ensure_ascii=False)}")
 
             check_response(resp)
             
@@ -691,7 +725,6 @@ class P123Api:
             return None
 
         # === 场景2：普通上传 ===
-        # 使用全局 Session，不再每次创建
         try:
             upload_data = resp.get("data")
             if not upload_data:
@@ -786,6 +819,8 @@ class P123Api:
             else:
                 logger.info(f"【123】小文件直传: {target_name}")
                 resp = self.client.upload_auth(upload_data)
+                # 【新增日志】
+                logger.info(f"【123】小文件鉴权响应: {json.dumps(resp, ensure_ascii=False)}")
                 check_response(resp)
                 
                 with open(local_path, "rb") as f:
@@ -800,7 +835,6 @@ class P123Api:
                             timeout=300
                         )
                         if resp_put.status_code != 200:
-                            # 增加小文件上传的错误日志
                             raise Exception(f"HTTP {resp_put.status_code} - {resp_put.text[:500]}")
                         break
                     except Exception as e:
@@ -810,6 +844,9 @@ class P123Api:
             # 完成确认
             upload_data["isMultipart"] = file_size > slice_size
             complete_resp = self.client.upload_complete(upload_data)
+            # 【新增日志】
+            logger.info(f"【123】上传完成响应: {json.dumps(complete_resp, ensure_ascii=False)}")
+            
             check_response(complete_resp)
 
             # 防御性检查与大文件兼容处理
