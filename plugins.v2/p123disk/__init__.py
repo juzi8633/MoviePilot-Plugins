@@ -2,6 +2,7 @@ from pathlib import Path
 from typing import Any, List, Dict, Tuple, Optional
 import threading
 import time
+import json # 新增引用，用于格式化日志
 
 from p123client import P123Client
 from .p123_api import P123Api
@@ -31,12 +32,17 @@ class P123AutoClient:
         if self._client is None:
             with self._lock:  # 双重检查锁定
                 if self._client is None:
+                    logger.info(f"【123】初始化 P123Client 实例...")
                     self._client = P123Client(self._passport, self._password)  # noqa
 
         def wrapped(*args, **kwargs):
             attr = getattr(self._client, name)
             if not callable(attr):
                 return attr
+            
+            # 增加调用日志
+            # logger.debug(f"【123】调用客户端方法: {name}") 
+            
             result = attr(*args, **kwargs)
             
             # 检查是否需要刷新Token
@@ -45,6 +51,7 @@ class P123AutoClient:
                 and result.get("code") == 401
                 and result.get("message") == "tokens number has exceeded the limit"
             ):
+                logger.warning(f"【123】捕获到 401 Token 失效错误: {result}")
                 # 获取锁，确保只有一个线程执行登录操作
                 with self._lock:
                     # 再次检查时间戳，防止重复刷新
@@ -59,7 +66,11 @@ class P123AutoClient:
                 attr = getattr(self._client, name)
                 if not callable(attr):
                     return attr
-                return attr(*args, **kwargs)
+                
+                logger.info(f"【123】重试调用方法: {name}")
+                retry_result = attr(*args, **kwargs)
+                return retry_result
+                
             return result
 
         return wrapped
@@ -73,7 +84,7 @@ class P123Disk(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/juzi8633/MoviePilot-Plugins/main/icons/P123Disk.png"
     # 插件版本
-    plugin_version = "1.7.1"
+    plugin_version = "1.7.2"
     # 插件作者
     plugin_author = "juzi8633"
     # 作者主页
@@ -124,6 +135,7 @@ class P123Disk(_PluginBase):
         初始化插件
         """
         if config:
+            logger.info(f"【123】开始加载配置: Enabled={config.get('enabled')}")
             storage_helper = StorageHelper()
             storages = storage_helper.get_storagies()
             if not any(
@@ -134,6 +146,7 @@ class P123Disk(_PluginBase):
                 storage_helper.add_storage(
                     storage=self._disk_name, name=self._disk_name, conf={}
                 )
+                logger.info(f"【123】已添加存储配置: {self._disk_name}")
 
             self._enabled = config.get("enabled")
             self._passport = config.get("passport")
@@ -143,6 +156,8 @@ class P123Disk(_PluginBase):
             self._webhook_url = config.get("webhook_url")
             self._webhook_secret = config.get("webhook_secret")
             self._upload_threads = config.get("upload_threads")
+            
+            logger.info(f"【123】配置参数: UploadThreads={self._upload_threads}, Webhook={bool(self._webhook_url)}")
 
             try:
                 self._client = P123AutoClient(self._passport, self._password)
@@ -154,6 +169,7 @@ class P123Disk(_PluginBase):
                     webhook_secret=self._webhook_secret,
                     upload_threads=self._upload_threads
                 )  # noqa
+                logger.info("【123】API 实例创建成功")
             except Exception as e:
                 logger.error(f"123云盘客户端创建失败: {e}")
 
@@ -395,7 +411,7 @@ class P123Disk(_PluginBase):
         lower_name = check_name.lower()
         
         if any(lower_name.endswith(suffix.lower()) for suffix in self._IGNORED_SUFFIXES):
-            logger.info(f"【123】跳过下载中/临时文件: {check_name}")
+            logger.info(f"【123】跳过下载中/临时文件: {check_name} (匹配规则)")
             # 返回 None 表示未执行上传，MoviePilot 会认为处理完成或跳过
             return None
             

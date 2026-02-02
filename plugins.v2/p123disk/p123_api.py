@@ -142,6 +142,8 @@ class P123Api:
                     while retry_list < max_list_retries:
                         try:
                             resp = self.client.fs_list(payload)
+                            # 增加Debug日志，记录API返回（可选）
+                            # logger.debug(f"【123】fs_list(ID:{current_id}) response: {json.dumps(resp, ensure_ascii=False)}")
                             check_response(resp)
                             break # 成功则跳出重试
                         except (ReadTimeout, ConnectTimeout) as net_err:
@@ -151,6 +153,7 @@ class P123Api:
                         except Exception as e:
                             # 非网络超时错误，直接抛出
                             logger.error(f"【123】列出目录异常 (ID: {current_id}): {e}")
+                            logger.debug(f"【123】异常响应数据: {json.dumps(resp, ensure_ascii=False) if resp else 'None'}")
                             if str(parent_path) in self._id_cache:
                                  del self._id_cache[str(parent_path)]
                             raise e
@@ -231,6 +234,9 @@ class P123Api:
             check_response(current_upload_url_resp)
         except Exception as e:
             logger.error(f"【123】获取分片上传URL失败(分片{slice_no}): {e}")
+            # 增加日志
+            if 'current_upload_url_resp' in locals():
+                logger.debug(f"【123】upload_prepare Response: {json.dumps(current_upload_url_resp, ensure_ascii=False)}")
             raise e
 
         while retry_count < max_retries:
@@ -304,6 +310,8 @@ class P123Api:
                 # 浏览目录也增加网络超时保护
                 try:
                     resp = self.client.fs_list(payload)
+                    # 增加日志
+                    logger.debug(f"【123】fs_list response (Page {page}): {json.dumps(resp, ensure_ascii=False)}")
                     check_response(resp)
                 except (ReadTimeout, ConnectTimeout):
                     logger.warning(f"【123】浏览目录超时，重试一次...")
@@ -360,6 +368,7 @@ class P123Api:
             parent_id = self._path_to_id(fileitem.path)
             
             resp = self.client.fs_mkdir(name, parent_id=parent_id)
+            logger.debug(f"【123】fs_mkdir response: {json.dumps(resp, ensure_ascii=False)}")
             check_response(resp)
             
             data = resp["data"]["Info"]
@@ -420,6 +429,8 @@ class P123Api:
             if not file_id:
                 return None
             resp = self.client.fs_info(int(file_id))
+            # 频繁调用，仅在Debug开启时记录
+            # logger.debug(f"【123】fs_info response: {json.dumps(resp, ensure_ascii=False)}")
             check_response(resp)
             data = resp["data"]["infoList"][0]
             return schemas.FileItem(
@@ -452,6 +463,7 @@ class P123Api:
         try:
             logger.info(f"【123】正在删除: {fileitem.path}")
             resp = self.client.fs_trash(int(fileitem.fileid), event="intoRecycle")
+            logger.debug(f"【123】fs_trash response: {json.dumps(resp, ensure_ascii=False)}")
             check_response(resp)
             # 主动清理缓存
             if fileitem.path in self._id_cache:
@@ -473,6 +485,7 @@ class P123Api:
                 "duplicate": 2,
             }
             resp = self.client.fs_rename(payload)
+            logger.debug(f"【123】fs_rename response: {json.dumps(resp, ensure_ascii=False)}")
             check_response(resp)
             # 清理旧缓存
             if fileitem.path in self._id_cache:
@@ -501,6 +514,7 @@ class P123Api:
                 "Size": int(size),
             }
             resp = self.client.download_info(payload)
+            logger.debug(f"【123】download_info response: {json.dumps(resp, ensure_ascii=False)}")
             check_response(resp)
             download_url = resp["data"]["DownloadUrl"]
             local_path = path or settings.TEMP_PATH / fileitem.name
@@ -645,6 +659,10 @@ class P123Api:
             logger.debug(f"【123】预检查Payload: {json.dumps(upload_req_payload, ensure_ascii=False)}")
             
             resp = self.client.upload_request(upload_req_payload)
+            
+            # 增加关键日志：打印API预检查返回
+            logger.debug(f"【123】upload_request Response: {json.dumps(resp, ensure_ascii=False)}")
+            
             check_response(resp)
             
             # === 场景1：秒传成功 ===
@@ -767,6 +785,9 @@ class P123Api:
             else:
                 logger.info(f"【123】小文件直传: {target_name}")
                 resp = self.client.upload_auth(upload_data)
+                
+                # 增加日志
+                logger.debug(f"【123】upload_auth response: {json.dumps(resp, ensure_ascii=False)}")
                 check_response(resp)
                 
                 with open(local_path, "rb") as f:
@@ -790,6 +811,10 @@ class P123Api:
             # 完成确认
             upload_data["isMultipart"] = file_size > slice_size
             complete_resp = self.client.upload_complete(upload_data)
+            
+            # 增加关键日志：打印上传完成响应
+            logger.debug(f"【123】upload_complete Response: {json.dumps(complete_resp, ensure_ascii=False)}")
+            
             check_response(complete_resp)
 
             # 防御性检查与大文件兼容处理
@@ -844,6 +869,7 @@ class P123Api:
             resp = self.client.fs_copy(
                 fileitem.fileid, parent_id=self._path_to_id(str(path))
             )
+            logger.debug(f"【123】fs_copy response: {json.dumps(resp, ensure_ascii=False)}")
             check_response(resp)
             logger.info(f"【123】复制成功: {fileitem.name} -> {path}")
             new_path = Path(path) / fileitem.name
@@ -862,6 +888,7 @@ class P123Api:
             resp = self.client.fs_move(
                 fileitem.fileid, parent_id=self._path_to_id(str(path))
             )
+            logger.debug(f"【123】fs_move response: {json.dumps(resp, ensure_ascii=False)}")
             check_response(resp)
             logger.info(f"【123】移动成功: {fileitem.name} -> {path}")
             new_path = Path(path) / fileitem.name
@@ -909,3 +936,23 @@ class P123Api:
             size=data.get("Size") if data.get("Type", 0) == 0 else None,
             modify_time=int(datetime.fromisoformat(data["UpdateAt"]).timestamp()),
         )
+    
+
+    
+    def support_transtype(self) -> dict:
+        """
+        支持的整理方式
+
+        :return: 支持的整理方式字典
+        """
+        return self.transtype
+
+    def is_support_transtype(self, transtype: str) -> bool:
+        """
+        是否支持整理方式
+
+        :param transtype: 整理方式 (move/copy)
+
+        :return: 是否支持
+        """
+        return transtype in self.transtype
