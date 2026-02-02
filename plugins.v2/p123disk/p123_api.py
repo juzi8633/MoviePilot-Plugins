@@ -855,7 +855,7 @@ class P123Api:
                 etag=file_md5,
                 status="uploaded",
                 speed=speed_str,
-                s3_key_flag=s3_key_flag
+                # s3_key_flag=s3_key_flag
             )
 
             return self._build_file_item(data, target_path)
