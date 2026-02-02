@@ -819,6 +819,8 @@ class P123Api:
 
             # 防御性检查与大文件兼容处理
             resp_data = complete_resp.get("data", {})
+
+            s3_key_flag = ""
             # 兼容逻辑：如果 data 为空但 code 为 0，视为成功
             if (not resp_data or "file_info" not in resp_data) and complete_resp.get("code") == 0:
                 logger.warning(f"【123】上传API返回成功但无元数据(可能是大文件合并中)，手动构造成功响应: {target_name}")
@@ -831,12 +833,13 @@ class P123Api:
                 }
             else:
                 data = resp_data.get("file_info", {})
+                s3_key_flag = data.get("S3KeyFlag", "")
 
             if not data or "FileName" not in data:
                 logger.error(f"【123】上传完成但数据异常: {json.dumps(complete_resp, ensure_ascii=False)}")
                 return None
 
-            end_time = time.time()
+            end_time = time.time() 
             duration = end_time - start_time
             speed_str = "Fast"
             if duration > 0:
@@ -851,7 +854,8 @@ class P123Api:
                 size=file_size,
                 etag=file_md5,
                 status="uploaded",
-                speed=speed_str
+                speed=speed_str,
+                s3_key_flag=s3_key_flag
             )
 
             return self._build_file_item(data, target_path)
